@@ -27,3 +27,4 @@ work/app-backup-2026-11-11/
 !muse-gadget-sdk/esp32/dev_signing_key.pem
 sdkconfig.signing
 *.sdkconfig.local
+!muse-gadget-sdk/linux/tests/vectors/*.pem
