@@ -77,19 +77,10 @@ jobs:
           gh release view v1.2.0 -R ayutaz/sanoTTS-jp --json assets --jq '.assets[].name' | tee "$WORK/assets.txt"
           gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern 'k1-dict-44000-2mb.bin'
           cp "$WORK/dl/k1-dict-44000-2mb.bin" "$MODEL_DIR/"
-          # The model is either an asset of its own or inside a zip of the release.
-          if grep -qx 'voice-v4-int8.bin' "$WORK/assets.txt"; then
-            gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern 'voice-v4-int8.bin'
-            cp "$WORK/dl/voice-v4-int8.bin" "$MODEL_DIR/"
-          else
-            for z in $(grep -E '\.zip$' "$WORK/assets.txt" | grep -iE 'voice|v4|model' || true); do
-              gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern "$z"
-              unzip -o -j -q "$WORK/dl/$z" '*voice-v4-int8.bin' -d "$WORK/unz" 2>/dev/null || true
-              [ -f "$WORK/unz/voice-v4-int8.bin" ] && break
-            done
-            [ -f "$WORK/unz/voice-v4-int8.bin" ] || { echo "::error::voice-v4-int8.bin was not found in the v1.2.0 release assets"; exit 1; }
-            cp "$WORK/unz/voice-v4-int8.bin" "$MODEL_DIR/"
-          fi
+          # The release asset is named saanotts-jp-v4-int8.bin (654032 bytes);
+          # the firmware expects it as voice-v4-int8.bin.
+          gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern 'saanotts-jp-v4-int8.bin'
+          cp "$WORK/dl/saanotts-jp-v4-int8.bin" "$MODEL_DIR/voice-v4-int8.bin"
           [ "$(stat -c %s "$MODEL_DIR/voice-v4-int8.bin")" = 654032 ] || { echo "::error::voice-v4-int8.bin has an unexpected size"; exit 1; }
           [ "$(stat -c %s "$MODEL_DIR/k1-dict-44000-2mb.bin")" = 977456 ] || { echo "::error::k1-dict-44000-2mb.bin has an unexpected size"; exit 1; }
           sha256sum "$MODEL_DIR"/*.bin

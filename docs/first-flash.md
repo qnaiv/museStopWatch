@@ -15,19 +15,17 @@
 | 書く場所 | ファイル | 入手先 |
 |---|---|---|
 | `0x0` | `muse-gadget-core.bin` | このリポジトリの [Releases](https://github.com/qnaiv/museStopWatch/releases)（または Actions の Artifact） |
-| `0x830000` | `voice-v4-int8.bin`（654,032 バイト） | [sanoTTS-jp v1.2.0](https://github.com/ayutaz/sanoTTS-jp/releases) |
+| `0x830000` | `saanotts-jp-v4-int8.bin`（654,032 バイト。ファームのビルドでは `voice-v4-int8.bin` という名前で使う） | [sanoTTS-jp v1.2.0](https://github.com/ayutaz/sanoTTS-jp/releases) |
 | `0x8F0000` | `k1-dict-44000-2mb.bin`（977,456 バイト） | 同じリリース |
 
 - 書き込み先は [partitions_musestopwatch.csv](../muse-gadget-sdk/esp32/partitions_musestopwatch.csv) の `sano_model`、`sano_dict` です。
-- 辞書は公式リリースのファイル一覧にそのままあります。モデルは、2026-11-14 に調べたときは、その名前のファイルが一覧に
-  見つかりませんでした（`golden-v4-int8.bin` は別のものです）。zip の中にあるかもしれません。
-  ビルドの実行ログ（「Fetch the sanoTTS-jp model and dictionary」の手順）に、公式リリースのファイル名の一覧が出ます。
+- 公式リリース v1.2.0 のファイル名は、モデルが `saanotts-jp-v4-int8.bin`、辞書が `k1-dict-44000-2mb.bin` です（2026-11-14 に、サイズが 654,032 / 977,456 バイトであることを確認）。
 - モデルと辞書が無くても起動はしますが、読み上げは使えないはずです（未確認）。
 
 ## 書き込みの例（PC の esptool）
 
 ```
-python -m esptool --chip esp32s3 --port <ポート> write_flash 0x0 muse-gadget-core.bin 0x830000 voice-v4-int8.bin 0x8F0000 k1-dict-44000-2mb.bin
+python -m esptool --chip esp32s3 --port <ポート> write_flash 0x0 muse-gadget-core.bin 0x830000 saanotts-jp-v4-int8.bin 0x8F0000 k1-dict-44000-2mb.bin
 ```
 
 - 書く前に、出荷時のフラッシュ全体をバックアップしておくと安心です:
