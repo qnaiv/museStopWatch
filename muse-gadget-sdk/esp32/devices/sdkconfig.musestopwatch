@@ -1,0 +1,36 @@
+# museStopWatch overlay (loaded last, after sdkconfig.muse-m5stack-stopwatch).
+# Japanese replies need the CJK caption font (GNU Unifont, kana + all CJK ideographs).
+CONFIG_MUSE_CJK_FONT=y
+# Settings > QR (AP Mode QR / Web QR) draws its codes with LVGL's QR widget.
+CONFIG_LV_USE_QRCODE=y
+# Japanese glyphs, anti-aliased: Noto Sans JP Medium 16 px (JIS X 0208) in place of Unifont.
+CONFIG_MUSE_CJK_FONT_NOTO_JP=y
+
+# museStopWatch: task list for the serial RAM report (>msw.mem, msw_mem.c)
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+# museStopWatch: the two draw threads used about 1.8 KB of 8 KB (>msw.mem, 2026-11-07); as ai-passport.
+CONFIG_LV_DRAW_THREAD_STACK_SIZE=5120
+
+# museStopWatch: partitions_muse.csv plus sanoTTS-jp's model and dictionary partitions.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_musestopwatch.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_musestopwatch.csv"
+# museStopWatch: per-task CPU time for >msw.cpu (msw_mem.c), to place the TTS task.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# museStopWatch mini apps (components/miniapp): apps see only the symbols in
+# its own table (sdk/exports.list). elf_loader's built-in libc and IDF tables
+# are searched before registered ones, so they're off: malloc must be the
+# tracked one, freed when the app ends.
+# CONFIG_ELF_LOADER_LIBC_SYMBOLS is not set
+# CONFIG_ELF_LOADER_ESPIDF_SYMBOLS is not set
+
+# museStopWatch: app.screenshot draws lvgl screens into a buffer (msw_app_shot.c).
+CONFIG_LV_USE_SNAPSHOT=y
+
+# museStopWatch: smaller voice session buffers (128 KB reply MP3, 2 s mic backlog,
+# 1 s decoded audio; about 610 KB less PSRAM), so mini apps have room (2026-11-10).
+CONFIG_MUSE_HATCH_COMPACT_BUFFERS=y
+
+# museStopWatch: firmware updates only from our own Releases (signed with our
+# key); any other URL, the official SDK's included, is refused even with force.
+CONFIG_HOMEHUB_OTA_URL_PREFIX="https://github.com/qnaiv/museStopWatch/releases/download/"

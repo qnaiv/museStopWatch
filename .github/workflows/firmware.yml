@@ -1,0 +1,174 @@
+name: Firmware
+
+# Builds the Muse StopWatch firmware with ESP-IDF 6.0.3, signed with our own
+# OTA key (repository secret MSW_SIGNING_KEY, an RSA-3072 PEM private key).
+#
+#  - Run it by hand (Actions > Firmware > Run workflow): the build is kept as an
+#    artifact (muse-gadget.bin for OTA, muse-gadget-core.bin for the first USB flash).
+#  - Push a tag such as v0.3.0 or v0.3.0-dev.1: the same files go to a GitHub
+#    Release (a tag with "-dev" is a pre-release).
+#
+# This repository is public, and so are its artifacts and releases. The
+# sanoTTS-jp model and dictionary have their own license (LICENSE-MODEL.md:
+# attribution and notices travel with every redistribution), so they are
+# needed to build but are never uploaded: muse-gadget-core.bin has every
+# partition except sano_model and sano_dict. See docs/first-flash.md.
+#
+# The firmware version comes from muse-gadget-sdk/esp32/version.txt; keep the tag
+# in step with it (OTA only takes a newer version).
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.3
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check the signing key
+        env:
+          MSW_SIGNING_KEY: ${{ secrets.MSW_SIGNING_KEY }}
+        run: |
+          if [ -z "$MSW_SIGNING_KEY" ]; then
+            echo "::error::Repository secret MSW_SIGNING_KEY is not set. Add an RSA-3072 PEM private key under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          printf '%s\n' "$MSW_SIGNING_KEY" > "$RUNNER_TEMP/msw_signing_key.pem"
+          chmod 600 "$RUNNER_TEMP/msw_signing_key.pem"
+          # Never echo the key; only check that it parses and has the size the SDK expects.
+          openssl rsa -in "$RUNNER_TEMP/msw_signing_key.pem" -noout -check
+          openssl rsa -in "$RUNNER_TEMP/msw_signing_key.pem" -noout -text | head -1
+          printf 'CONFIG_SECURE_BOOT_SIGNING_KEY="%s"\n' "$RUNNER_TEMP/msw_signing_key.pem" > "$RUNNER_TEMP/sdkconfig.signing"
+
+      # The sanoTTS-jp voice model and dictionary are not in git (see
+      # sanotts/model/README.md). Fetch them from the official v1.2.0 release
+      # and check the sizes written in that README.
+      - name: Fetch the sanoTTS-jp model and dictionary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MODEL_DIR=muse-gadget-sdk/esp32/components/muse_diy_stopwatch/sanotts/model
+          WORK="$RUNNER_TEMP/sano"
+          mkdir -p "$WORK"
+          if ! command -v gh >/dev/null; then
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends curl unzip ca-certificates >/dev/null
+            curl -fsSL https://github.com/cli/cli/releases/download/v2.63.2/gh_2.63.2_linux_amd64.tar.gz | tar -xz -C "$WORK"
+            export PATH="$WORK/gh_2.63.2_linux_amd64/bin:$PATH"
+          fi
+          command -v unzip >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip >/dev/null; }
+          gh release view v1.2.0 -R ayutaz/sanoTTS-jp --json assets --jq '.assets[].name' | tee "$WORK/assets.txt"
+          gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern 'k1-dict-44000-2mb.bin'
+          cp "$WORK/dl/k1-dict-44000-2mb.bin" "$MODEL_DIR/"
+          # The model is either an asset of its own or inside a zip of the release.
+          if grep -qx 'voice-v4-int8.bin' "$WORK/assets.txt"; then
+            gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern 'voice-v4-int8.bin'
+            cp "$WORK/dl/voice-v4-int8.bin" "$MODEL_DIR/"
+          else
+            for z in $(grep -E '\.zip$' "$WORK/assets.txt" | grep -iE 'voice|v4|model' || true); do
+              gh release download v1.2.0 -R ayutaz/sanoTTS-jp --dir "$WORK/dl" --pattern "$z"
+              unzip -o -j -q "$WORK/dl/$z" '*voice-v4-int8.bin' -d "$WORK/unz" 2>/dev/null || true
+              [ -f "$WORK/unz/voice-v4-int8.bin" ] && break
+            done
+            [ -f "$WORK/unz/voice-v4-int8.bin" ] || { echo "::error::voice-v4-int8.bin was not found in the v1.2.0 release assets"; exit 1; }
+            cp "$WORK/unz/voice-v4-int8.bin" "$MODEL_DIR/"
+          fi
+          [ "$(stat -c %s "$MODEL_DIR/voice-v4-int8.bin")" = 654032 ] || { echo "::error::voice-v4-int8.bin has an unexpected size"; exit 1; }
+          [ "$(stat -c %s "$MODEL_DIR/k1-dict-44000-2mb.bin")" = 977456 ] || { echo "::error::k1-dict-44000-2mb.bin has an unexpected size"; exit 1; }
+          sha256sum "$MODEL_DIR"/*.bin
+
+      - name: Build
+        working-directory: muse-gadget-sdk/esp32
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-m5stack-stopwatch;devices/sdkconfig.musestopwatch;$RUNNER_TEMP/sdkconfig.signing"
+          idf.py -B build-muse-m5stack-stopwatch -DIDF_TARGET=esp32s3 \
+            "-DSDKCONFIG=build-muse-m5stack-stopwatch/sdkconfig" \
+            "-DSDKCONFIG_DEFAULTS=$DEFAULTS" \
+            "-DEXTRA_COMPONENT_DIRS=components/muse_diy_stopwatch" \
+            build
+          idf.py -B build-muse-m5stack-stopwatch size | tail -30
+
+      - name: Collect the files
+        working-directory: muse-gadget-sdk/esp32
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh" > /dev/null
+          B=build-muse-m5stack-stopwatch
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          # OTA image (the app slot only). The firmware looks for this name.
+          cp "$B/muse-gadget.bin" "$OUT/muse-gadget.bin"
+          # First USB flash at offset 0: bootloader, partition table, app, the
+          # Japanese font and the rest, but NOT the sanoTTS-jp model and
+          # dictionary (their own license; flash them from the official release).
+          python3 - "$B" "$OUT" <<'PY'
+          import json, os, subprocess, sys
+          build, out = sys.argv[1], sys.argv[2]
+          args = json.load(open(os.path.join(build, "flasher_args.json")))
+          skip = {"voice-v4-int8.bin", "k1-dict-44000-2mb.bin"}
+          parts = []
+          for off, f in sorted(args["flash_files"].items(), key=lambda kv: int(kv[0], 16)):
+              if os.path.basename(f) in skip:
+                  print("left out:", off, f)
+                  continue
+              parts += [off, os.path.join(build, f)]
+          fs = args["flash_settings"]
+          for cmd in ("merge-bin", "merge_bin"):
+              r = subprocess.run([sys.executable, "-m", "esptool", "--chip", "esp32s3", cmd,
+                                  "-o", os.path.join(out, "muse-gadget-core.bin"),
+                                  "--flash-mode", fs["flash_mode"], "--flash-freq", fs["flash_freq"],
+                                  "--flash-size", fs["flash_size"]] + parts)
+              if r.returncode == 0:
+                  break
+          else:
+              sys.exit("merge failed")
+          print("flash_args:", json.dumps({k: v for k, v in args["flash_files"].items()}, indent=1))
+          PY
+          cd "$OUT"
+          sha256sum * | tee SHA256SUMS.txt
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muse-stopwatch-firmware
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: muse-stopwatch-firmware
+          path: out
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          case "$TAG" in *-dev*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "Muse StopWatch firmware $TAG. muse-gadget.bin is for OTA. muse-gadget-core.bin is for the first USB flash at offset 0x0; it does not contain the sanoTTS-jp model and dictionary (see docs/first-flash.md)." "${flags[@]}"

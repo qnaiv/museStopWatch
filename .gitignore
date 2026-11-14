@@ -1,0 +1,29 @@
+.venv/
+.tools/
+.pio/
+build/
+backups/
+__pycache__/
+*.pyc
+.claude/settings.local.json
+upstream/
+
+# raw build, flash and serial logs (machine paths, device ids)
+work/logs-*/
+work/*.log
+
+# Local only, not in the repository (2026-11-10, user decision): the Zundamon avatar and its sources
+apps/zundaclaude/
+work/zundamon/
+work/app-backup-2026-11-11/
+
+# built mini apps: only the sources go in apps/ (2026-11-14)
+*.mswapp
+
+# Public repository: keep secrets, keys, logs and flash backups out (2026-11-14)
+.env
+*.key
+*.pem
+!muse-gadget-sdk/esp32/dev_signing_key.pem
+sdkconfig.signing
+*.sdkconfig.local
