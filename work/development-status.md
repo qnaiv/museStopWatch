@@ -1643,3 +1643,32 @@ GET /fs/raw が通った）。ただしユーザー評は「情報は出たが�
   tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
 - 実機未検証: ビルドは CI で確認する。カード表示の見栄えは OTA 後に
   ユーザーが確認する。
+
+## 2026-11-15 — 0.3.0-dev.13
+
+2026-11-15 夜、ユーザーが実機の写真を送り、文字盤の返信テキストが
+左右にずれて見切れていると指摘した（日本語の行が左端で約2文字
+欠け、右にはみ出す）。原因は列幅計算の文字幅: caption_font() は
+lv_font_unscii_16（ラテン文字 8px）で、CJK は 16px セルのフォール
+バックで描かれるのに、ページの列数・ボックス幅の計算が 'M'
+（8px）を1文字幅として割っていたため、日本語の行がボックスの
+2倍の幅になり見切れていた。
+
+### dev.13: 列幅計算を CJK グリフ幅に修正
+
+- muse_ui.c の caption_font() の直後に caption_cjk_cw() を追加。
+  CONFIG_MUSE_CJK_FONT 時は U+3042「あ」をフォールバック経由で
+  測り（>0 ならそれを返す）、それ以外は従来どおり 'M' の幅。
+- 'M' 測定を caption_cjk_cw() に置換したのは CJK 関係の5箇所のみ:
+  build_answer の cw、apply_text_size の cjk_cols、build_history
+  の cw、muse_state_set_cjk_page の呼び出し2箇所。latin 側
+  （latin_cols / latin_cw / set_latin_page）と name_cw は無変更。
+- cw が 16 になることで列数は半分になるが、ボックス幅はピクセル
+  計算のまま正しく、ページ容量の上限ループも従来どおり効く。
+
+### 検証
+
+- ホストテスト: tests.test_muse_watcher_controls 13件、tests.test_muse_turn_sleep 3件、
+  tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
+- 実機未検証: ビルドは CI で確認する。返信テキストの見切れが
+  直ったかは OTA 後にユーザーが確認する。

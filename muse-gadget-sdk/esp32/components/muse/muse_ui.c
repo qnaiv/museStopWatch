@@ -688,6 +688,21 @@ static const lv_font_t *caption_font(void)
 #endif
 }
 
+/* One CJK character's width in the caption font. unscii's 'M' is 8 px, but
+ * the CJK fallback draws 16 px cells, so column math off 'M' makes Japanese
+ * lines twice as wide as their box and they clip. Measure a kana through
+ * the fallback chain instead; without CJK, 'M' is the cell there is. */
+static int caption_cjk_cw(void)
+{
+#if CONFIG_MUSE_CJK_FONT
+    int w = lv_font_get_glyph_width(caption_font(), 0x3042, 0);
+    if (w > 0) {
+        return w;
+    }
+#endif
+    return lv_font_get_glyph_width(caption_font(), 'M', ' ');
+}
+
 /* The small screen's caption band: two lines of unscii-8, as replies are paged
  * there, 2 px apart with 2 px above and below. */
 static int caption_band_h(void)
@@ -991,7 +1006,7 @@ static void build_answer(lv_obj_t *face, int ring_in)
         spk_x = -(int)sqrtf((float)(d * d - spk_y * spk_y));
     }
     const lv_font_t *font = caption_font();
-    int cw = lv_font_get_glyph_width(font, 'M', ' ');
+    int cw = caption_cjk_cw();
     int pitch = lv_font_get_line_height(font) + CAPTION_LINE_SPACE;
 
     answer_layout_t *l = &s_answers[ANSWER_HEARD];
@@ -1206,7 +1221,7 @@ static void apply_text_size(void)
      * bytes of the caption a character at most, but its pages without any
      * show in the Text size font, so no more of its rows than that has. */
 #if CONFIG_MUSE_CJK_FONT
-    int cjk_cols = (s_w - 6) / lv_font_get_glyph_width(caption_font(), 'M', ' ');
+    int cjk_cols = (s_w - 6) / caption_cjk_cw();
     int cjk_lines = full_rows(caption_font(), CJK_LINE_SPACE);
     cjk_lines = cjk_lines < lines ? cjk_lines : lines;
     while (cjk_lines > 1 && (3 * cjk_cols + 1) * cjk_lines > MUSE_CAPTION_MAX - 1) {
@@ -1284,7 +1299,7 @@ static lv_obj_t *hist_button(lv_obj_t *parent, const lv_font_t *font, const char
 static void build_history(lv_obj_t *tile)
 {
     const lv_font_t *font = caption_font();
-    int cw = lv_font_get_glyph_width(font, 'M', ' ');
+    int cw = caption_cjk_cw();
     int pitch = lv_font_get_line_height(font) + CAPTION_LINE_SPACE;
     int cols = cw > 0 ? 320 / cw : 24;
     int lines = 11;
@@ -2229,7 +2244,7 @@ static void build_screen(void)
          * on a landscape screen with the height for them, such as the
          * BOX-3's 320x240 (set_caption_font). */
         s_cjk_lines = !s_tall && s_h >= 200 ? 2 : 1;
-        muse_state_set_cjk_page((SMALL_BAND_W - 2 * CJK_BAND_PAD) / lv_font_get_glyph_width(caption_font(), 'M', ' '),
+        muse_state_set_cjk_page((SMALL_BAND_W - 2 * CJK_BAND_PAD) / caption_cjk_cw(),
                                 s_cjk_lines);
 #endif
 #if CONFIG_MUSE_LATIN_FONT
@@ -2277,7 +2292,7 @@ static void build_screen(void)
              * but its pages without any show in Montserrat, so every page keeps
              * Montserrat's rows, and the pager its pixel widths too. */
 #if CONFIG_MUSE_CJK_FONT
-            muse_state_set_cjk_page(w / lv_font_get_glyph_width(caption_font(), 'M', ' '), lines);
+            muse_state_set_cjk_page(w / caption_cjk_cw(), lines);
 #endif
 #if CONFIG_MUSE_LATIN_FONT
             muse_state_set_latin_page(w / lv_font_get_glyph_width(&muse_font_latin_16, 'M', ' '), lines);
