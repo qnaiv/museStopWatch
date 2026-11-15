@@ -142,11 +142,10 @@ static lv_obj_t *s_settings;
 /* museStopWatch: the mini-app launcher, left of the face (components/muse_diy_stopwatch/miniapp). */
 static lv_obj_t *s_launcher;
 void msw_launcher_build(lv_obj_t *tile) __attribute__((weak));
-/* museStopWatch: the avatar picker, below the face (idea 009). */
-static lv_obj_t *s_avatars;
-void msw_avatar_build(lv_obj_t *tile) __attribute__((weak));
-/* museStopWatch: the reply history, above the face (swipe down for it). */
+/* museStopWatch: the reply history, below the face (swipe up for it). */
 static lv_obj_t *s_history;
+/* museStopWatch: quick settings, above the face (swipe down for them). */
+static lv_obj_t *s_quick;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 static lv_obj_t *s_hist_body, *s_hist_pos, *s_hist_chat;
 static muse_review_view_t s_hist_view;
@@ -208,6 +207,11 @@ static lv_obj_t *s_cv_lbl;      /* museStopWatch: "CV: ..." while voice.play's v
 const char *msw_voice_credit(void) __attribute__((weak));
 static lv_obj_t *s_power_lbl;
 static lv_obj_t *s_caption_lbl;
+static int s_cap_h, s_cap_y;   /* the caption's built height and centre offset, to restore it */
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+static bool s_caption_full;    /* the kept reply is up full-screen, the avatar hidden */
+static lv_obj_t *s_quick_bright, *s_quick_bright_val, *s_quick_vol, *s_quick_vol_val;
+#endif
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
 static lv_obj_t *s_review_position;
@@ -1360,6 +1364,77 @@ static void update_history(void)
         lv_label_set_text(s_hist_pos, pos);
     }
 }
+
+/*
+ * The quick settings tile (above the face, swipe down for it): the two
+ * sliders a hand reaches for most — brightness and volume — applied as
+ * they move (update_power and the audio path poll the settings). Avatar
+ * switching used to live on the tile below the face; it is in Settings
+ * now, and the reply history took that tile's place.
+ */
+static void on_quick_bright(lv_event_t *e)
+{
+    muse_settings_set_brightness((int)lv_slider_get_value(lv_event_get_target(e)));
+}
+
+static void on_quick_vol(lv_event_t *e)
+{
+    muse_settings_set_volume((int)lv_slider_get_value(lv_event_get_target(e)));
+}
+
+static lv_obj_t *quick_slider(lv_obj_t *tile, const lv_font_t *font, const char *name, int y,
+                              int min, int max, int val, lv_event_cb_t cb, lv_obj_t **val_out)
+{
+    lv_obj_t *l = make_label(tile, font, COLOR_LIT);
+    lv_label_set_text(l, name);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_t *sl = lv_slider_create(tile);
+    lv_obj_set_size(sl, 280, 12);
+    lv_slider_set_range(sl, min, max);
+    lv_slider_set_value(sl, val, LV_ANIM_OFF);
+    lv_obj_align(sl, LV_ALIGN_TOP_MID, 0, y + 34);
+    lv_obj_add_event_cb(sl, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_t *v = make_label(tile, font, COLOR_DIM);
+    lv_obj_align(v, LV_ALIGN_TOP_MID, 0, y + 58);
+    *val_out = v;
+    return sl;
+}
+
+static void build_quick(lv_obj_t *tile)
+{
+    const lv_font_t *font = caption_font();
+    lv_obj_t *title = make_label(tile, font, COLOR_LIT);
+    lv_label_set_text(title, "クイック設定");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 44);
+    s_quick_bright = quick_slider(tile, font, "明るさ", 104, 10, 100, muse_settings_brightness(),
+                                  on_quick_bright, &s_quick_bright_val);
+    s_quick_vol = quick_slider(tile, font, "音量", 216, 0, 100, muse_settings_volume(),
+                               on_quick_vol, &s_quick_vol_val);
+    lv_obj_t *hint = make_label(tile, font, COLOR_DIM);
+    lv_label_set_text(hint, "上にスワイプでもどる");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -36);
+}
+
+/* While the quick tile is up, keep its sliders honest (the yellow button
+ * and Settings change the same values). A slider being dragged is left
+ * alone: its own event applies the value. */
+static void update_quick(void)
+{
+    if (!s_quick || !s_tv || lv_tileview_get_tile_active(s_tv) != s_quick) return;
+    if (!lv_obj_has_state(s_quick_bright, LV_STATE_PRESSED)
+        && lv_slider_get_value(s_quick_bright) != muse_settings_brightness()) {
+        lv_slider_set_value(s_quick_bright, muse_settings_brightness(), LV_ANIM_OFF);
+    }
+    if (!lv_obj_has_state(s_quick_vol, LV_STATE_PRESSED)
+        && lv_slider_get_value(s_quick_vol) != muse_settings_volume()) {
+        lv_slider_set_value(s_quick_vol, muse_settings_volume(), LV_ANIM_OFF);
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d%%", muse_settings_brightness());
+    if (strcmp(buf, lv_label_get_text(s_quick_bright_val)) != 0) lv_label_set_text(s_quick_bright_val, buf);
+    snprintf(buf, sizeof(buf), "%d%%", muse_settings_volume());
+    if (strcmp(buf, lv_label_get_text(s_quick_vol_val)) != 0) lv_label_set_text(s_quick_vol_val, buf);
+}
 #endif
 
 static void build_screen(void)
@@ -1381,8 +1456,8 @@ static void build_screen(void)
         lv_obj_set_scrollbar_mode(s_tv, LV_SCROLLBAR_MODE_OFF);
         int col = 0;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-        /* museStopWatch: the reply history sits above the face (swipe down
-         * for it), so the face's row is 1 and the avatar picker moves to 2. */
+        /* museStopWatch: quick settings sit above the face and the reply
+         * history below it, so the face's row is 1. */
         const int row = 1;
 #else
         const int row = 0;
@@ -1397,9 +1472,8 @@ static void build_screen(void)
         }
         int face_col = col;
         s_face = lv_tileview_add_tile(s_tv, col++, row, (s_launcher ? LV_DIR_LEFT | LV_DIR_RIGHT : LV_DIR_RIGHT)
-                                                       | (msw_avatar_build ? LV_DIR_BOTTOM : 0)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-                                                       | LV_DIR_TOP   /* down to the history */
+                                                       | LV_DIR_TOP | LV_DIR_BOTTOM   /* down to quick settings, up to the history */
 #endif
                                                        );
         /* It never scrolls, but LVGL would size its scrollbars from all its
@@ -1412,19 +1486,19 @@ static void build_screen(void)
         /* museStopWatch: LV_DIR_HOR as the launcher, so a swipe past the end is no tap. */
         s_settings = lv_tileview_add_tile(s_tv, col, row, s_launcher ? LV_DIR_HOR : LV_DIR_LEFT);
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-        s_history = lv_tileview_add_tile(s_tv, face_col, 0, LV_DIR_BOTTOM);
-        lv_obj_set_scrollbar_mode(s_history, LV_SCROLLBAR_MODE_OFF);
-        /* Match the face: the tile's theme background otherwise shows as a
+        /* Match the face: the tiles' theme background otherwise shows as a
          * different-coloured square. */
+        s_quick = lv_tileview_add_tile(s_tv, face_col, 0, LV_DIR_BOTTOM);
+        lv_obj_set_scrollbar_mode(s_quick, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_style_bg_color(s_quick, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_quick, LV_OPA_COVER, 0);
+        build_quick(s_quick);
+        s_history = lv_tileview_add_tile(s_tv, face_col, row + 1, LV_DIR_TOP);
+        lv_obj_set_scrollbar_mode(s_history, LV_SCROLLBAR_MODE_OFF);
         lv_obj_set_style_bg_color(s_history, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_history, LV_OPA_COVER, 0);
         build_history(s_history);
 #endif
-        if (msw_avatar_build) {   /* museStopWatch: swipe up from Muse for the avatar picker */
-            s_avatars = lv_tileview_add_tile(s_tv, face_col, row + 1, LV_DIR_TOP);
-            lv_obj_set_scrollbar_mode(s_avatars, LV_SCROLLBAR_MODE_OFF);
-            msw_avatar_build(s_avatars);
-        }
         lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);   /* start on Muse */
         lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
         face = s_face;
@@ -1630,6 +1704,8 @@ static void build_screen(void)
     lv_obj_set_style_text_line_space(s_caption_lbl, CAPTION_LINE_SPACE, 0);
     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, cap_top + cap_h / 2);
+    s_cap_h = cap_h;
+    s_cap_y = cap_top + cap_h / 2;
 
     /* Chunky level meter. */
     int span = METER_SEGS * (METER_SEG_PX + METER_GAP_PX) - METER_GAP_PX;
@@ -1752,7 +1828,7 @@ static void update_control_hints(muse_mode_t mode)
     /* Don't obscure settings rows/keyboards with floating physical icons.
      * museStopWatch: nor the app launcher (msw_launcher_build). */
     lv_obj_t *tile = s_tv ? lv_tileview_get_tile_active(s_tv) : NULL;
-    bool settings = tile && (tile == s_settings || tile == s_launcher || tile == s_avatars || tile == s_history);
+    bool settings = tile && (tile == s_settings || tile == s_launcher || tile == s_quick || tile == s_history);
     lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, settings);
@@ -2317,6 +2393,33 @@ static void update_status(muse_mode_t mode, float now)
         }
 #endif
         lv_label_set_text(lbl, shown);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        {
+            /* A kept reply gets the whole screen: the caption band's two
+             * lines cut it off, so while one is up the label fills the
+             * face and the avatar steps aside (a tap dismisses it, as
+             * before). Hints keep the band, and anything else — a new
+             * turn above all — puts the face back. */
+            bool full = lbl == s_caption_lbl && shown[0] && mode == MUSE_MODE_IDLE && !muse_state_hint_pending();
+            if (full && !s_caption_full) {
+                s_caption_full = true;
+                lv_obj_set_size(s_caption_lbl, s_w - 32, s_h - 96);
+                lv_obj_align(s_caption_lbl, LV_ALIGN_TOP_MID, 0, 60);
+                lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_WRAP);
+                lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
+            } else if (!full && s_caption_full) {
+                s_caption_full = false;
+                lv_obj_set_size(s_caption_lbl, CAPTION_W, s_cap_h);
+                lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, s_cap_y);
+                lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
+                lv_obj_remove_flag(s_canvas, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+#endif
 #if CONFIG_MUSE_SMALL_FULL_REPLY
         if (s_full_reply) {
             set_full_font();
@@ -2465,7 +2568,22 @@ static void frame_tick(lv_timer_t *timer)
         .happy = muse_state_happiness(),
         .working = muse_voice_call_view() == MUSE_VOICE_VIEW_WORKING ? 1.0f : 0,
     };
-    if (!muse_board->epaper || mode != s_last_epaper_pose) {
+    bool render = !muse_board->epaper || mode != s_last_epaper_pose;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* Battery: a quiet idle face — nothing said, nothing to read — doesn't
+     * need the avatar redrawn 25 times a second. After ~10 s of it the
+     * animation runs at a quarter rate; anything new wakes it back up. */
+    static unsigned s_quiet_ticks;
+    bool quiet = mode == MUSE_MODE_IDLE && s_face_active
+                 && lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
+                 && (!s_reply_lbl || lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN));
+    if (quiet) {
+        if (++s_quiet_ticks > 250 && s_quiet_ticks % 4 != 0) render = false;
+    } else {
+        s_quiet_ticks = 0;
+    }
+#endif
+    if (render) {
         muse_pixel_render(&pose);
         invalidate_muse();
         s_last_epaper_pose = mode;
@@ -2473,6 +2591,7 @@ static void frame_tick(lv_timer_t *timer)
 
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     update_history();
+    update_quick();
 #endif
     update_status(mode, now);
 }

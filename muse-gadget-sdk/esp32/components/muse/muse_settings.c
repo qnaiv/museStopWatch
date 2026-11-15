@@ -36,6 +36,7 @@ static const char *TAG = "muse_settings";
 static struct {
     uint8_t volume;
     bool speaker_on;
+    uint8_t sound_mode;   /* MUSE_SOUND_*: speaker_on is (sound_mode == MUSE_SOUND_ON) */
     uint8_t mic_gain;
     uint8_t brightness;
     uint16_t sleep_s;
@@ -50,6 +51,7 @@ static struct {
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
+    .sound_mode = MUSE_SOUND_ON,
     .mic_gain = 30,
     .brightness = 100,
     .sleep_s = 120,
@@ -124,6 +126,13 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "speaker", &b) == ESP_OK) {
         s.speaker_on = b;
     }
+    /* The sound mode follows the legacy speaker flag until it is set itself. */
+    if (nvs_get_u8(s_nvs, "snd_mode", &b) == ESP_OK && b <= MUSE_SOUND_ON) {
+        s.sound_mode = b;
+    } else {
+        s.sound_mode = s.speaker_on ? MUSE_SOUND_ON : MUSE_SOUND_OFF;
+    }
+    s.speaker_on = s.sound_mode == MUSE_SOUND_ON;
     load_u8("mic_gain", &s.mic_gain);
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
     if (nvs_get_u8(s_nvs, "voice_notes", &b) == ESP_OK) {
@@ -162,6 +171,7 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
+int muse_settings_sound_mode(void) { return s.sound_mode; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
@@ -223,7 +233,18 @@ void muse_settings_set_volume(int pct)
 void muse_settings_set_speaker_on(bool on)
 {
     s.speaker_on = on;
+    s.sound_mode = on ? MUSE_SOUND_ON : MUSE_SOUND_OFF;
     save_u8("speaker", on);
+    save_u8("snd_mode", s.sound_mode);
+    notify(MUSE_SETTING_SPEAKER);
+}
+
+void muse_settings_set_sound_mode(int mode)
+{
+    s.sound_mode = clampi(mode, MUSE_SOUND_OFF, MUSE_SOUND_ON);
+    s.speaker_on = s.sound_mode == MUSE_SOUND_ON;
+    save_u8("speaker", s.speaker_on);
+    save_u8("snd_mode", s.sound_mode);
     notify(MUSE_SETTING_SPEAKER);
 }
 

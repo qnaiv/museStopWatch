@@ -1600,6 +1600,7 @@ static void build_power_page(lv_obj_t *tile)
 
 #include "msw_settings_qr.inc"   /* museStopWatch */
 #include "msw_wake_ui.inc"        /* museStopWatch: Settings > Wake word */
+#include "msw_avatar_ui.inc"      /* museStopWatch: Settings > Avatar */
 
 /* ---------- Home ---------- */
 
@@ -1637,6 +1638,9 @@ static void build_home(lv_obj_t *tile)
     if (msw_wake_built_in()) {   /* museStopWatch */
         row(list, LV_SYMBOL_AUDIO, "Wake word", &s_home_wake, on_nav, (void *)&MSW_WAKE);
     }
+    if (msw_avatar_built_in()) {   /* museStopWatch */
+        row(list, LV_SYMBOL_IMAGE, "Avatar", &s_home_avatar, on_nav, (void *)&MSW_AVATAR);
+    }
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
     if (muse_video_supported()) {
@@ -1670,6 +1674,10 @@ static void tick_home(void)
         set_text(s_home_sound, muse_board->mic_init ? "Mic only" : "No audio");
     } else if (muse_settings_speaker_on()) {
         set_val(s_home_sound, "Vol %d%%", muse_settings_volume());
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    } else if (muse_settings_sound_mode() == MUSE_SOUND_VIBRATE) {
+        set_text(s_home_sound, "Vibrate");
+#endif
     } else {
         set_text(s_home_sound, "Muted");
     }
@@ -1782,6 +1790,8 @@ void muse_settings_ui_tick(bool visible)
         tick_battery();
     } else if (s_wake && s_current == s_wake) {   /* museStopWatch */
         msw_tick_wake();
+    } else if (s_avatar_pg && s_current == s_avatar_pg) {   /* museStopWatch */
+        msw_tick_avatar();
     } else {
         msw_tick_qr();   /* museStopWatch */
     }

@@ -679,11 +679,26 @@ static void dedicated_buttons(unsigned ev)
         if (muse_state_asleep()) {
             set_asleep(false, muse_board->speaker_button);   /* wake-only press */
         } else if (muse_state_mode(NULL) != MUSE_MODE_OFF) {
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+            /* museStopWatch: the yellow button cycles three sound modes —
+             * sound, vibrate only, mute — vibrate sitting between the two
+             * the button used to toggle. */
+            static const char *const SOUND_HINTS[] = { "SPEAKER OFF", "VIBRATE ONLY", "SPEAKER ON" };
+            int cur = muse_settings_sound_mode();
+            int next = cur == MUSE_SOUND_ON ? MUSE_SOUND_VIBRATE
+                       : cur == MUSE_SOUND_VIBRATE ? MUSE_SOUND_OFF
+                                                   : MUSE_SOUND_ON;
+            muse_settings_set_sound_mode(next);
+            if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+                muse_state_set_hint(SOUND_HINTS[next]);
+            }
+#else
             bool on = !muse_settings_speaker_on();
             muse_settings_set_speaker_on(on);
             if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
                 muse_state_set_hint(on ? "SPEAKER ON" : "SPEAKER OFF");
             }
+#endif
         }
     }
 }

@@ -56,6 +56,11 @@ void muse_settings_set_listener(muse_setting_cb_t cb);
 
 int muse_settings_volume(void);         /* 0..100 */
 bool muse_settings_speaker_on(void);    /* off: replies are shown, not played */
+/* museStopWatch: the speaker is one of three sound modes; VIBRATE keeps the
+ * speaker off and pulses the motor when a reply arrives instead. */
+enum { MUSE_SOUND_OFF = 0, MUSE_SOUND_VIBRATE = 1, MUSE_SOUND_ON = 2 };
+int muse_settings_sound_mode(void);
+void muse_settings_set_sound_mode(int mode);
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_brightness(void);     /* 10..100 */
 int muse_settings_sleep_s(void);        /* 0 = never */

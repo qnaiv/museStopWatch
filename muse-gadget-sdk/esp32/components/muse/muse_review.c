@@ -22,6 +22,33 @@
 #include "freertos/semphr.h"
 #include "muse_chat_priv.h"
 #include "muse_text.h"
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+#include "esp_timer.h"
+#include "muse_settings.h"
+/* The board's vibration motor (boards/board_m5stack_stopwatch.c). */
+void msw_board_vibrate(int pct) __attribute__((weak));
+
+static void vibrate_off(void *arg)
+{
+    (void)arg;
+    if (msw_board_vibrate) msw_board_vibrate(0);
+}
+
+/* Vibrate-only sound mode: a new reply announces itself with one short
+ * pulse of the motor instead of the speaker. */
+static void pulse_for_reply(void)
+{
+    if (!msw_board_vibrate || muse_settings_sound_mode() != MUSE_SOUND_VIBRATE) return;
+    static esp_timer_handle_t off;
+    if (!off) {
+        const esp_timer_create_args_t args = { .callback = vibrate_off, .name = "vib_off" };
+        if (esp_timer_create(&args, &off) != ESP_OK) return;
+    }
+    esp_timer_stop(off);
+    msw_board_vibrate(80);
+    esp_timer_start_once(off, 150 * 1000);
+}
+#endif
 
 #define REVIEW_CAP (32 * 1024)
 /* The last replies, newest first. Each buffer is lazily allocated in PSRAM,
@@ -125,6 +152,9 @@ void muse_review_store(uint32_t turn, const char *text)
         }
     }
     xSemaphoreGive(s_lock);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    if (fresh) pulse_for_reply();
+#endif
 }
 
 bool muse_review_step(int direction)
