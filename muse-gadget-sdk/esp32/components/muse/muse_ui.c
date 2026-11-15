@@ -594,7 +594,7 @@ static void on_caption_clicked(lv_event_t *e)
 {
     (void)e;
     if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
-        muse_state_set_caption("");
+        muse_state_set_caption("%s", "");
     }
 }
 

@@ -1292,3 +1292,7 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
   ローカルの git には GitHub 認証が無く通常の git push が使えなかったため、GitHub 連携の push_files で
   同じ内容を main に直接コミットした（ローカルブランチのコミット a7777f2 と内容は同一）。
   ビルド（GitHub Actions）と実機確認はまだ。
+- 初回 CI（run #4、自動起動）: 署名鍵チェック成功（Secret `MSW_SIGNING_KEY` 登録済み・RSA 3072 を確認）、
+  モデル取得成功、Build が 1 件だけエラーで失敗 — muse_ui.c:597 `muse_state_set_caption("")` の
+  zero-length format string（-Werror=format-zero-length）。`"%s", ""` に直して main へ push 済み（run #5 で再試行）。
+  署名鍵 Secret の登録有無という未確認事項はこれで解消。実機ファーム側の鍵との一致は OTA を試すまで未確認。
