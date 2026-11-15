@@ -1561,3 +1561,51 @@ dev.9 の実機報告を受けた診断追加（変更は muse_ui.c のみ + ver
   tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
 - 実機未検証: ビルドは CI で確認する。タイルに「取得失敗: …」が出るか、
   あるいは版が表示されるかは OTA 後にユーザーが確認する。
+
+## 2026-11-15 — 0.3.0-dev.11
+
+dev.10 の実機診断で原因が確定したため、取得経路そのものを切り替える
+（変更は muse_ui.c のみ + version.txt）。
+
+### dev.10 で「取得失敗: status 403」
+
+- dev.10 は 2026-11-15 22:43 頃に OTA 済み。タイルの診断表示は
+  「取得失敗: status 403」。POST /fs/read のリクエストはサーバーに
+  届いているが、サーバーが 403 で拒否していることが確定した。
+- 仮説: (a) このデバイスには /fs/read の device-token 操作が有効化
+  されておらず、image_fetch.c が VM ファイルの取得に使う
+  GET /fs/raw/<path> なら通る可能性がある。(b) パスがホーム直下の
+  裸の "watch_edition.json" で、VM のパスルール（ホーム相対、
+  "workspace/picture.jpg" のような形）に反していた可能性がある。
+  SDK 自身の /fs/read の例もサブディレクトリ配下のパスだった。
+- 版ファイルは VM 側で ~/workspace/watch_edition.json にも配置済み
+  （同一内容、555 バイト）。
+
+### dev.11: /fs/raw 優先 + workspace 配下パスへ
+
+- DASH_PATH を "watch_edition.json" から "workspace/watch_edition.json"
+  に変更（両経路で使用）。
+- 取得戦略（1回の試行あたり、順に）:
+  - 主経路: GET /fs/raw/workspace/watch_edition.json を
+    muse_link_req_open で発行。ヘッダは dev.9 と同じ組
+    （x-request-id、x-app-id "hatch-web"、Accept）。応答ボディは
+    ファイルそのもの（JSON エンベロープなし）で、フレームを従来の
+    蓄積バッファに集め、上限は既存のキャッシュ上限 8KB。
+    成功条件は HTTP 200 かつバイト列が版 JSON としてパースできること。
+  - 副経路（主経路が失敗したときのみ）: 従来の POST /fs/read を
+    新パス "workspace/watch_edition.json" で実行（他は無変更）。
+- 診断（dev.10 の s_dash_err を拡張）: 経路ごとのステージを
+  s_dash_raw_err / s_dash_read_err に分けて記録し、両経路とも失敗
+  したら「取得失敗: raw <ステージ>/read <ステージ>」の形で両方の
+  結果を表示する（例: raw status 403/read status 403）。片方だけの
+  失敗・成功時は従来どおり成功でクリア、または該当経路の表示。
+- トリガ・キャッシュ・描画・全体締切（30秒）は無変更。主経路の
+  応答待ちは従来のチャンク待ち 8 秒を上限に、締切の残り時間で頭打ち。
+
+### 検証
+
+- ホストテスト: tests.test_muse_watcher_controls 13件、tests.test_muse_turn_sleep 3件、
+  tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
+- 実機未検証: ビルドは CI で確認する。ダッシュボードに版が表示
+  されるか、あるいは両経路の失敗ステージが出るかは OTA 後に
+  ユーザーが確認する。

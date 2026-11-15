@@ -1494,20 +1494,25 @@ static void update_quick(void)
 
 /*
  * The dashboard tile (right of the face): the morning/evening "edition"
- * Muse writes to watch_edition.json in the VM's home. The tile reads it
- * with a daemon request (POST /fs/read, in <=1 KB chunks until the reply
- * says eof) on its own task — the request callback runs on the session
- * task, so it only copies frames into a buffer and hands over; the task
- * below does the waiting, the envelope parsing and the caching. The last
- * good edition is cached in PSRAM and shown as-is when a fetch fails.
- * Display only: nothing on the tile sends anything back. dev.8: the whole
- * fetch runs against one deadline (DASH_FETCH_DEADLINE_US) and logs its
- * stages (TAG "muse_ui", "dash: …"), so a stall resolves and says why.
- * dev.10: the same stages also land in s_dash_err, and the tile shows the
- * last one ("取得失敗: …") — the log is not readable off the device, the
- * tile is.
+ * Muse writes to watch_edition.json on the VM. The tile fetches it on its
+ * own task — the request callback runs on the session task, so it only
+ * copies frames into a buffer and hands over; the task below does the
+ * waiting, the parsing and the caching. The last good edition is cached in
+ * PSRAM and shown as-is when a fetch fails. Display only: nothing on the
+ * tile sends anything back. dev.8: the whole fetch runs against one
+ * deadline (DASH_FETCH_DEADLINE_US) and logs its stages (TAG "muse_ui",
+ * "dash: …"), so a stall resolves and says why. dev.10: the same stages
+ * also land in s_dash_err, and the tile shows the last one ("取得失敗: …")
+ * — the log is not readable off the device, the tile is.
+ * dev.11: POST /fs/read of the bare home path drew a 403 on the real
+ * device (dev.10's tile said so), so the fetch now tries GET /fs/raw/<path>
+ * first — the route image_fetch.c reads VM files through, whose reply body
+ * is the file itself, no envelope — and the edition lives under
+ * workspace/ (DASH_PATH), the home-relative shape the VM's file rules
+ * expect. /fs/read with the same new path stays as the fallback, and
+ * s_dash_err names both routes' stages ("raw …/read …") when both fail.
  */
-#define DASH_PATH "watch_edition.json"
+#define DASH_PATH "workspace/watch_edition.json"
 #define DASH_CAP (8 * 1024)        /* the whole edition, at most */
 #define DASH_CHUNK 1024            /* one /fs/read: len <= 1024 (AGENTS.md) */
 #define DASH_ENV_CAP (12 * 1024)   /* one reply envelope: the frame bound */
@@ -1532,6 +1537,8 @@ static volatile bool s_dash_dirty;     /* the cache changed: re-render */
 static volatile bool s_dash_wake;      /* the screen woke: fetch (update_sleep) */
 static int64_t s_dash_ok_us;           /* the last successful fetch */
 static char s_dash_err[48];            /* dev.10: the last fetch's failure stage, "" if none */
+static char s_dash_raw_err[32];        /* dev.11: the /fs/raw stage, "" if it landed */
+static char s_dash_read_err[32];       /* dev.11: the /fs/read stage, "" if it landed */
 
 /* On the session task: copy the frame out and hand over, nothing more. */
 static void dash_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
@@ -1560,6 +1567,71 @@ static void dash_on_frame(void *ctx, int status, const uint8_t *data, size_t len
     }
 }
 
+/* dev.11 PRIMARY: one GET /fs/raw/<path> for the whole edition — the reply
+ * body is the file itself, accumulated by dash_on_frame like an envelope
+ * but never parsed as one. False: s_dash_raw_err says why. */
+static bool dash_raw_fetch(size_t *total, int64_t deadline)
+{
+    if (esp_timer_get_time() >= deadline) {
+        ESP_LOGW(TAG, "dash: /fs/raw skipped, fetch already over its deadline");
+        snprintf(s_dash_raw_err, sizeof(s_dash_raw_err), "deadline");
+        return false;
+    }
+    /* The same identity headers the /fs/read chunks carry (dev.9). */
+    char req_id[40];
+    snprintf(req_id, sizeof(req_id), "muse-%08" PRIx32 "-%08" PRIx32, esp_random(), esp_random());
+    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web",
+                              "Accept", "application/json", NULL };
+    s_dash_gen++;
+    s_dash_env_len = 0;
+    s_dash_env_over = false;
+    s_dash_status = 0;
+    xSemaphoreTake(s_dash_done, 0);   /* drain a stale give */
+    int64_t id = muse_link_req_open("GET", "/fs/raw/" DASH_PATH, headers, true, dash_on_frame,
+                                    (void *)(uintptr_t)s_dash_gen);
+    if (!id) {
+        ESP_LOGW(TAG, "dash: /fs/raw open refused (session down or busy)");
+        snprintf(s_dash_raw_err, sizeof(s_dash_raw_err), "open refused");
+        return false;
+    }
+    /* One chunk's wait, capped by what is left of the fetch deadline. */
+    int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
+    int wait_ms = left_ms > DASH_CHUNK_WAIT_MS ? DASH_CHUNK_WAIT_MS : (int)left_ms;
+    if (wait_ms <= 0 ||
+        xSemaphoreTake(s_dash_done, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "dash: /fs/raw no reply in %d ms", wait_ms);
+        snprintf(s_dash_raw_err, sizeof(s_dash_raw_err), "no reply");
+        muse_link_req_cancel(id);
+        s_dash_gen++;   /* a late frame of this request drops */
+        return false;
+    }
+    if (s_dash_status != 200 || s_dash_env_over || s_dash_env_len > DASH_CAP) {
+        bool over = s_dash_env_over || s_dash_env_len > DASH_CAP;
+        ESP_LOGW(TAG, "dash: /fs/raw status %d%s (%u bytes)", s_dash_status,
+                 over ? " (reply too large)" : "", (unsigned)s_dash_env_len);
+        if (over) {
+            snprintf(s_dash_raw_err, sizeof(s_dash_raw_err), "reply too large");
+        } else {
+            snprintf(s_dash_raw_err, sizeof(s_dash_raw_err), "status %d", s_dash_status);
+        }
+        return false;
+    }
+    memcpy(s_dash_new, s_dash_env, s_dash_env_len);
+    s_dash_new[s_dash_env_len] = '\0';
+    /* Landed means the edition itself: the bytes must parse as JSON. */
+    cJSON *probe = cJSON_Parse(s_dash_new);
+    if (!probe) {
+        ESP_LOGW(TAG, "dash: /fs/raw reply is %u bytes but not JSON",
+                 (unsigned)s_dash_env_len);
+        snprintf(s_dash_raw_err, sizeof(s_dash_raw_err), "not json");
+        return false;
+    }
+    cJSON_Delete(probe);
+    *total = s_dash_env_len;
+    ESP_LOGI(TAG, "dash: edition fetched via /fs/raw, %u bytes", (unsigned)*total);
+    return true;
+}
+
 /* One /fs/read chunk of the edition into s_dash_new at *total. False: stop. */
 static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
 {
@@ -1583,19 +1655,19 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
                                     (void *)(uintptr_t)s_dash_gen);
     if (!id) {
         ESP_LOGW(TAG, "dash: /fs/read open refused (session down or busy)");
-        snprintf(s_dash_err, sizeof(s_dash_err), "open refused");
+        snprintf(s_dash_read_err, sizeof(s_dash_read_err), "open refused");
         return false;
     }
     if (!muse_link_req_send(id, body, strlen(body), true, 2000)) {
         ESP_LOGW(TAG, "dash: /fs/read send failed at offset %u", (unsigned)offset);
-        snprintf(s_dash_err, sizeof(s_dash_err), "send failed");
+        snprintf(s_dash_read_err, sizeof(s_dash_read_err), "send failed");
         muse_link_req_cancel(id);
         return false;
     }
     if (xSemaphoreTake(s_dash_done, pdMS_TO_TICKS(DASH_CHUNK_WAIT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "dash: /fs/read no reply in %d ms at offset %u",
                  DASH_CHUNK_WAIT_MS, (unsigned)offset);
-        snprintf(s_dash_err, sizeof(s_dash_err), "no reply");
+        snprintf(s_dash_read_err, sizeof(s_dash_read_err), "no reply");
         muse_link_req_cancel(id);
         s_dash_gen++;   /* a late frame of this request drops, not lands in
                          * the next chunk's envelope */
@@ -1605,9 +1677,9 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
         ESP_LOGW(TAG, "dash: /fs/read status %d%s at offset %u", s_dash_status,
                  s_dash_env_over ? " (reply too large)" : "", (unsigned)offset);
         if (s_dash_env_over) {
-            snprintf(s_dash_err, sizeof(s_dash_err), "reply too large");
+            snprintf(s_dash_read_err, sizeof(s_dash_read_err), "reply too large");
         } else {
-            snprintf(s_dash_err, sizeof(s_dash_err), "status %d", s_dash_status);
+            snprintf(s_dash_read_err, sizeof(s_dash_read_err), "status %d", s_dash_status);
         }
         return false;
     }
@@ -1649,7 +1721,7 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
     } else {
         ESP_LOGW(TAG, "dash: /fs/read reply at %u is not a usable envelope (%u bytes)",
                  (unsigned)offset, (unsigned)s_dash_env_len);
-        snprintf(s_dash_err, sizeof(s_dash_err), "bad envelope");
+        snprintf(s_dash_read_err, sizeof(s_dash_read_err), "bad envelope");
     }
     return ok;
 }
@@ -1668,44 +1740,67 @@ static void dash_fetch_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(250));
         }
         size_t total = 0;
-        bool eof = false, ok = muse_link_req_ready();
+        bool ok = muse_link_req_ready();
         ESP_LOGI(TAG, "dash: fetch start (link %s)", ok ? "ready" : "down");
+        s_dash_raw_err[0] = '\0';
+        s_dash_read_err[0] = '\0';
         if (!ok) {
             snprintf(s_dash_err, sizeof(s_dash_err), "link down");
         }
-        for (int i = 0; ok && !eof && i < 16; i++) {
-            if (esp_timer_get_time() >= deadline) {
-                ESP_LOGW(TAG, "dash: fetch over its deadline at %u bytes", (unsigned)total);
-                snprintf(s_dash_err, sizeof(s_dash_err), "deadline");
-                ok = false;
-                break;
+        /* dev.11: GET /fs/raw first; POST /fs/read is the fallback. got =
+         * s_dash_new holds a parseable edition of total bytes. */
+        bool got = false;
+        if (ok && dash_raw_fetch(&total, deadline)) {
+            got = true;
+        } else if (ok) {
+            total = 0;
+            bool eof = false, rd_ok = true;
+            for (int i = 0; rd_ok && !eof && i < 16; i++) {
+                if (esp_timer_get_time() >= deadline) {
+                    ESP_LOGW(TAG, "dash: fetch over its deadline at %u bytes", (unsigned)total);
+                    snprintf(s_dash_read_err, sizeof(s_dash_read_err), "deadline");
+                    rd_ok = false;
+                    break;
+                }
+                size_t before = total;
+                rd_ok = dash_read_chunk(total, &total, &eof);
+                if (rd_ok && !eof && total == before) {
+                    rd_ok = false;   /* no progress and not eof: do not spin */
+                }
             }
-            size_t before = total;
-            ok = dash_read_chunk(total, &total, &eof);
-            if (ok && !eof && total == before) {
-                ok = false;   /* no progress and not eof: do not spin */
+            if (rd_ok && eof && total > 0) {
+                s_dash_new[total] = '\0';
+                /* Only a parseable edition replaces the cache. */
+                cJSON *probe = cJSON_Parse(s_dash_new);
+                if (probe) {
+                    cJSON_Delete(probe);
+                    got = true;
+                } else {
+                    ESP_LOGW(TAG, "dash: fetched %u bytes but not JSON; cache kept",
+                             (unsigned)total);
+                    snprintf(s_dash_read_err, sizeof(s_dash_read_err), "not json");
+                }
             }
         }
         bool cached = false;
-        if (ok && eof && total > 0) {
-            s_dash_new[total] = '\0';
-            /* Only a parseable edition replaces the cache. */
-            cJSON *probe = cJSON_Parse(s_dash_new);
-            if (probe) {
-                cJSON_Delete(probe);
-                memcpy(s_dash_json, s_dash_new, total + 1);
-                s_dash_ok_us = esp_timer_get_time();
-                s_dash_err[0] = '\0';   /* a full fetch landed: no failure to show */
-                s_dash_dirty = true;
-                cached = true;
-                ESP_LOGI(TAG, "dash: edition fetched, %u bytes", (unsigned)total);
-            } else {
-                ESP_LOGW(TAG, "dash: fetched %u bytes but not JSON; cache kept",
-                         (unsigned)total);
-                snprintf(s_dash_err, sizeof(s_dash_err), "not json");
-            }
+        if (got && total > 0) {
+            memcpy(s_dash_json, s_dash_new, total + 1);
+            s_dash_ok_us = esp_timer_get_time();
+            s_dash_err[0] = '\0';   /* a full fetch landed: no failure to show */
+            s_dash_dirty = true;
+            cached = true;
+            ESP_LOGI(TAG, "dash: edition fetched, %u bytes", (unsigned)total);
         }
         if (!cached) {
+            /* Name both routes when both were tried and failed. */
+            if (s_dash_raw_err[0] && s_dash_read_err[0]) {
+                snprintf(s_dash_err, sizeof(s_dash_err), "raw %s/read %s",
+                         s_dash_raw_err, s_dash_read_err);
+            } else if (s_dash_raw_err[0]) {
+                snprintf(s_dash_err, sizeof(s_dash_err), "raw %s", s_dash_raw_err);
+            } else if (s_dash_read_err[0]) {
+                snprintf(s_dash_err, sizeof(s_dash_err), "read %s", s_dash_read_err);
+            }
             ESP_LOGW(TAG, "dash: fetch failed; showing the cached edition");
         }
         s_dash_busy = false;
