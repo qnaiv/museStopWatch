@@ -89,6 +89,8 @@ static const char *TAG = "muse_ui";
 #define COLOR_ACCENT 0xa77dff
 #define COLOR_DOT_OFF 0x3a3358
 #define COLOR_LIT 0xf2efff
+#define COLOR_CARD_BG 0x201d33    /* dashboard section card, a step above the tile's black */
+#define COLOR_CARD_BAR 0xa78bfa   /* dashboard section card title accent bar */
 #define SETTINGS_TICK_S 0.25f
 
 /* Text on 128 px screens, as in the button menu (muse_menu.c). */
@@ -1847,49 +1849,89 @@ static void render_dash(void)
     const lv_font_t *font = caption_font();
     lv_obj_clean(s_dash_box);
     int y = 0;
+    bool shown = false;
     cJSON *sections = root ? cJSON_GetObjectItemCaseSensitive(root, "sections") : NULL;
     if (cJSON_IsArray(sections)) {
         cJSON *sec;
         cJSON_ArrayForEach(sec, sections) {
             cJSON *t = cJSON_GetObjectItemCaseSensitive(sec, "t");
             cJSON *lines = cJSON_GetObjectItemCaseSensitive(sec, "lines");
-            if (cJSON_IsString(t) && t->valuestring[0]) {
-                lv_obj_t *h = make_label(s_dash_box, font, COLOR_LIT);
-                lv_label_set_text(h, t->valuestring);
-                lv_obj_set_pos(h, 10, y);
-                lv_obj_update_layout(h);
-                y += lv_obj_get_height(h) + 4;
-            }
+            const char *title = cJSON_IsString(t) ? t->valuestring : "";
+            /* Join the section's lines, each prefixed with "・" unless it
+             * already carries a bullet of its own. */
+            size_t used = 0;
+            s_dash_scratch[0] = '\0';
             if (cJSON_IsArray(lines)) {
-                size_t used = 0;
-                s_dash_scratch[0] = '\0';
                 cJSON *line;
                 cJSON_ArrayForEach(line, lines) {
-                    if (!cJSON_IsString(line)) {
+                    if (!cJSON_IsString(line) || !line->valuestring[0]) {
                         continue;
                     }
-                    size_t n = strlen(line->valuestring);
-                    if (used + n + 2 > DASH_CAP) {
+                    const char *s = line->valuestring;
+                    bool bullet = !strncmp(s, "・", 3) || !strncmp(s, "•", 3);
+                    size_t n = strlen(s);
+                    if (used + (bullet ? 0 : 3) + n + 2 > DASH_CAP) {
                         break;
                     }
-                    memcpy(s_dash_scratch + used, line->valuestring, n);
+                    if (!bullet) {
+                        memcpy(s_dash_scratch + used, "・", 3);
+                        used += 3;
+                    }
+                    memcpy(s_dash_scratch + used, s, n);
                     used += n;
                     s_dash_scratch[used++] = '\n';
                 }
                 if (used) {
                     s_dash_scratch[used - 1] = '\0';   /* no trailing newline */
-                    lv_obj_t *b = make_label(s_dash_box, font, COLOR_CAPTION);
-                    lv_obj_set_width(b, 320);
-                    lv_label_set_long_mode(b, LV_LABEL_LONG_MODE_WRAP);
-                    lv_label_set_text(b, s_dash_scratch);
-                    lv_obj_set_pos(b, 10, y);
-                    lv_obj_update_layout(b);
-                    y += lv_obj_get_height(b) + 14;
                 }
             }
+            if (!title[0] && !used) {
+                continue;   /* an empty section draws no card */
+            }
+            /* One card per section: rounded, a step above the tile's black,
+             * an accent bar beside the title, the lines underneath. */
+            lv_obj_t *card = lv_obj_create(s_dash_box);
+            lv_obj_remove_style_all(card);
+            lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_CARD_BG), 0);
+            lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(card, 14, 0);
+            lv_obj_set_pos(card, 0, y);
+            lv_obj_set_width(card, 340);
+            int cy = 12;   /* top padding */
+            if (title[0]) {
+                lv_obj_t *h = make_label(card, font, COLOR_LIT);
+                lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_LEFT, 0);
+                lv_label_set_text(h, title);
+                lv_obj_set_pos(h, 12 + 4 + 10, cy);
+                lv_obj_update_layout(h);
+                lv_obj_t *bar = lv_obj_create(card);
+                lv_obj_remove_style_all(bar);
+                lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_size(bar, 4, lv_obj_get_height(h));
+                lv_obj_set_style_radius(bar, 2, 0);
+                lv_obj_set_style_bg_color(bar, lv_color_hex(COLOR_CARD_BAR), 0);
+                lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+                lv_obj_set_pos(bar, 12, cy);
+                cy += lv_obj_get_height(h) + 6;
+            }
+            if (used) {
+                lv_obj_t *b = make_label(card, font, COLOR_CAPTION);
+                lv_obj_set_style_text_align(b, LV_TEXT_ALIGN_LEFT, 0);
+                lv_obj_set_width(b, 302);
+                lv_label_set_long_mode(b, LV_LABEL_LONG_MODE_WRAP);
+                lv_obj_set_style_text_line_space(b, 6, 0);
+                lv_label_set_text(b, s_dash_scratch);
+                lv_obj_set_pos(b, 12 + 4 + 10, cy);
+                lv_obj_update_layout(b);
+                cy += lv_obj_get_height(b);
+            }
+            lv_obj_set_height(card, cy + 10);   /* bottom padding */
+            y += cy + 10 + 10;                  /* the card, then the gap */
+            shown = true;
         }
     }
-    if (!y) {
+    if (!shown) {
         lv_obj_t *none = make_label(s_dash_box, font, COLOR_DIM);
         lv_label_set_text(none, root ? "表示できる項目がありません" : "まだ届いていません");
         lv_obj_set_pos(none, 10, 0);
