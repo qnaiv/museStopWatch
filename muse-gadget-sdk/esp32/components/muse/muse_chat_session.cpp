@@ -336,6 +336,7 @@ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
 static void mark(mark_t m);
 static bool open_note(void);
 static void log_marks(void);
+enum : uint8_t { MARK_WAIT, MARK_NO, MARK_YES };   /* museStopWatch: msg_t.mark values, defined with the mark handling below */
 static size_t msw_ask_cut(const char *text, bool *ask);   /* museStopWatch: defined with the mark handling */
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
@@ -1686,7 +1687,6 @@ static const char *msg_id(cJSON *payload, cJSON *event)
  * or spoken, in a turn too.
  */
 #define MSW_MARK "[to_stopwatch]"
-enum : uint8_t { MARK_WAIT, MARK_NO, MARK_YES };
 
 static bool msw_space(char c)
 {
