@@ -2570,18 +2570,22 @@ static void frame_tick(lv_timer_t *timer)
     };
     bool render = !muse_board->epaper || mode != s_last_epaper_pose;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-    /* Battery: a quiet idle face — nothing said, nothing to read — doesn't
-     * need the avatar redrawn 25 times a second. After ~10 s of it the
-     * animation runs at a quarter rate; anything new wakes it back up. */
+    /* Battery: the avatar doesn't need redrawing 25 times a second —
+     * a quarter of that (about 6 fps) reads fine and costs far less,
+     * so the pose renders at a quarter rate all the time. A quiet idle
+     * face — nothing said, nothing to read — drops further after
+     * ~10 s, to a sixteenth (nearly still); anything new wakes it up. */
     static unsigned s_quiet_ticks;
+    static unsigned s_frame_ticks;
     bool quiet = mode == MUSE_MODE_IDLE && s_face_active
                  && lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
                  && (!s_reply_lbl || lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN));
     if (quiet) {
-        if (++s_quiet_ticks > 250 && s_quiet_ticks % 4 != 0) render = false;
+        s_quiet_ticks++;
     } else {
         s_quiet_ticks = 0;
     }
+    if (++s_frame_ticks % (s_quiet_ticks > 250 ? 16 : 4) != 0) render = false;
 #endif
     if (render) {
         muse_pixel_render(&pose);
