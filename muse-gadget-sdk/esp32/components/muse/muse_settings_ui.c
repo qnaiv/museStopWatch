@@ -1643,6 +1643,7 @@ static void build_power_page(lv_obj_t *tile)
 #include "msw_settings_qr.inc"   /* museStopWatch */
 #include "msw_wake_ui.inc"        /* museStopWatch: Settings > Wake word */
 #include "msw_avatar_ui.inc"      /* museStopWatch: Settings > Avatar */
+#include "msw_yellow_ui.inc"      /* museStopWatch: Settings > Yellow button (dev.16) */
 
 /* ---------- Home ---------- */
 
@@ -1683,6 +1684,9 @@ static void build_home(lv_obj_t *tile)
     if (msw_avatar_built_in()) {   /* museStopWatch */
         row(list, LV_SYMBOL_IMAGE, "Avatar", &s_home_avatar, on_nav, (void *)&MSW_AVATAR);
     }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    row(list, LV_SYMBOL_LIST, "Yellow button", &s_home_yellow, on_nav, (void *)&MSW_YELLOW);   /* dev.16 */
+#endif
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
     if (muse_video_supported()) {
@@ -1834,7 +1838,13 @@ void muse_settings_ui_tick(bool visible)
         msw_tick_wake();
     } else if (s_avatar_pg && s_current == s_avatar_pg) {   /* museStopWatch */
         msw_tick_avatar();
-    } else {
+    }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    else if (s_yellow_pg && s_current == s_yellow_pg) {   /* museStopWatch dev.16 */
+        msw_tick_yellow();
+    }
+#endif
+    else {
         msw_tick_qr();   /* museStopWatch */
     }
 }

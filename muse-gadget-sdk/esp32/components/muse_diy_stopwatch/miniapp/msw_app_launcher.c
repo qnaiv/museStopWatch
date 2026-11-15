@@ -19,6 +19,7 @@
 #include "lvgl.h"
 #include "muse_board.h"
 #include "muse_settings.h"
+#include "muse_ui.h"   /* dev.16: muse_ui_request_timer, the built-in timer cell */
 #include "msw_text.h"
 #include "esp_attr.h"
 #include "msw_app_priv.h"
@@ -174,6 +175,57 @@ static void on_hold(lv_event_t *e)
     lv_obj_align_to(dl, x, LV_ALIGN_OUT_LEFT_MID, -8, 0);
 }
 
+/* dev.16: the built-in countdown timer leads the grid. It is firmware,
+ * not an installed app — no details panel, nothing to remove — and a
+ * tap opens the timer screen on Muse's face (muse_ui.c). Drawn like
+ * an app with no icon: its name's first character in a coloured ring. */
+static void on_timer_tap(lv_event_t *e)
+{
+    (void)e;
+    if (s_info) {
+        return;
+    }
+    muse_ui_request_timer();
+}
+
+static lv_obj_t *timer_cell(lv_obj_t *parent)
+{
+    lv_obj_t *c = lv_obj_create(parent);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_size(c, CELL, CELL + 8);
+    lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(c, on_timer_tap, LV_EVENT_SHORT_CLICKED, NULL);
+
+    lv_obj_t *ring = lv_obj_create(c);
+    lv_obj_remove_style_all(ring);
+    lv_obj_set_size(ring, ICON_D, ICON_D);
+    lv_obj_align(ring, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ring, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(ring, lv_color_hex(0xF9A825), 0);
+    lv_obj_set_style_border_width(ring, 2, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(0x4A5868), 0);
+    lv_obj_set_style_bg_color(ring, lv_color_hex(0x3A4858), LV_STATE_PRESSED);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ring, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_style_clip_corner(ring, true, 0);
+    lv_obj_t *l = lv_label_create(ring);
+    lv_obj_set_style_text_font(l, msw_font_cjk(&lv_font_montserrat_20), 0);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_label_set_text(l, "タ");
+    lv_obj_center(l);
+    lv_obj_t *name = lv_label_create(c);
+    lv_obj_set_width(name, CELL);
+    lv_obj_set_style_text_font(name, jp(), 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(0xD0D8E0), 0);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_label_set_text(name, "タイマー");
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, ICON_D + 4);
+    return c;
+}
+
 static void free_items(void)
 {
     for (int i = 0; i < s_nitems; i++) {
@@ -266,6 +318,7 @@ static void rebuild(void)
         }
     }
     s_nitems = n;
+    timer_cell(s_grid);   /* dev.16: the built-in timer always leads */
     for (int i = 0; i < n; i++) {
         cell(s_grid, &s_items[i], i);
     }
@@ -279,7 +332,7 @@ static void rebuild(void)
     }
     if (n == 0) {
         lv_obj_remove_flag(s_empty, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_empty, s_ready ? "アプリはまだありません。\nMuse に「アプリを作って」と\n頼んでみてください。"
+        lv_label_set_text(s_empty, s_ready ? "ほかのアプリはまだありません。\nMuse に「アプリを作って」と\n頼んでみてください。"
                                            : "準備中…");
     } else {
         lv_obj_add_flag(s_empty, LV_OBJ_FLAG_HIDDEN);

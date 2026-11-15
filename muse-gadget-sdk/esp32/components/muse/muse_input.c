@@ -674,6 +674,53 @@ static bool update_wifi_nap(TickType_t now, bool paused)
 /* Independent POWER never goes through PTT, AUX's menu or its setup double
  * click. LONG is supplied by the board only after a validated hold. */
 static bool s_power_down, s_power_swallow;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/* museStopWatch dev.16: the yellow button's hold. A press keeps doing
+ * its short-press job at once (dev.14's face switch); holding it for
+ * YEL_LONG_US — the power key's validated 1.5 s hold — fires the
+ * long-press action Settings assigns (the timer by default) once, and
+ * the release after it is swallowed. A press that only woke the watch
+ * starts no hold, as a wake-only power press starts no shutdown. */
+#define YEL_LONG_US (1500 * 1000)
+static int64_t s_yel_press_us;   /* when the live press began; 0 = none or spent */
+static bool s_yel_long_fired;
+
+/* The mini-app store's start (muse_diy_stopwatch/miniapp), for an
+ * assigned app launch; weak, like msw_app_button below. */
+extern bool msw_app_start(const char *id, const char **code, char *msg, size_t msg_len)
+    __attribute__((weak));
+
+static void yellow_long_press(void)
+{
+    switch (muse_ui_yellow_long_action()) {
+    case MUSE_YEL_LONG_APP: {
+        const char *id = muse_ui_yellow_long_app();
+        if (id && id[0] && msw_app_start) {
+            const char *code;
+            char msg[64];
+            msw_app_start(id, &code, msg, sizeof(msg));   /* a gone app just fails */
+        }
+        break;
+    }
+    case MUSE_YEL_LONG_FACE:
+        if (muse_state_mode(NULL) != MUSE_MODE_OFF) {
+            bool clock = muse_ui_toggle_face_mode();
+            if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+                muse_state_set_hint(clock ? "CLOCK" : "AVATAR");
+            }
+        }
+        break;
+    case MUSE_YEL_LONG_NONE:
+        break;
+    default:   /* MUSE_YEL_LONG_TIMER, the default */
+        muse_ui_request_timer();
+        if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+            muse_state_set_hint("TIMER");
+        }
+        break;
+    }
+}
+#endif
 
 static void power_release(void)
 {
@@ -739,6 +786,9 @@ static void dedicated_buttons(unsigned ev)
         muse_state_poke();
         if (muse_state_asleep()) {
             set_asleep(false, muse_board->speaker_button);   /* wake-only press */
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+            s_yel_press_us = 0;   /* dev.16: a wake-only press starts no hold */
+#endif
         } else if (muse_state_mode(NULL) != MUSE_MODE_OFF) {
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
             /* museStopWatch dev.14: the yellow button switches the face
@@ -746,11 +796,14 @@ static void dedicated_buttons(unsigned ev)
              * into the quick-settings tile. Switching is all it does, so
              * a stray press costs nothing. The hint names the face the
              * press is taking the watch to (English, like the sound
-             * hints it replaces). */
+             * hints it replaces). dev.16: the press also arms the hold
+             * below; a short press is exactly this, unchanged. */
             bool clock = muse_ui_toggle_face_mode();
             if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
                 muse_state_set_hint(clock ? "CLOCK" : "AVATAR");
             }
+            s_yel_press_us = esp_timer_get_time();
+            s_yel_long_fired = false;
 #else
             bool on = !muse_settings_speaker_on();
             muse_settings_set_speaker_on(on);
@@ -760,6 +813,20 @@ static void dedicated_buttons(unsigned ev)
 #endif
         }
     }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* dev.16: the yellow hold, checked on every pass (dedicated_buttons
+     * runs each input poll, event or none). The release disarms it; a
+     * hold that fired leaves nothing for the release to do. */
+    if (ev & MUSE_BTN_SPEAKER_RELEASE) {
+        s_yel_press_us = 0;
+    }
+    if (s_yel_press_us && !s_yel_long_fired
+        && esp_timer_get_time() - s_yel_press_us >= YEL_LONG_US) {
+        s_yel_long_fired = true;
+        muse_state_poke();
+        yellow_long_press();
+    }
+#endif
 }
 
 static void input_task(void *arg)

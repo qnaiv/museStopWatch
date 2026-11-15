@@ -248,7 +248,15 @@ static int s_quick_snd_shown = -1;
 #else
 #define FONT_CLOCK (&lv_font_montserrat_28)
 #endif
-static lv_obj_t *s_clock_box, *s_clock_time, *s_clock_date, *s_clock_batt;
+static lv_obj_t *s_clock_box, *s_clock_time, *s_clock_date;
+/* dev.16: the clock's small rows — the edition's weather and next event
+ * (render_dash keeps the strings in s_dash_wx / s_dash_next), and the
+ * running timer's remaining time. dev.14's battery row is gone: the
+ * header chrome at the top of the face already shows the battery. */
+static lv_obj_t *s_clock_wx, *s_clock_next, *s_clock_timer;
+static char s_dash_wx[96];
+static char s_dash_next[128];
+static int64_t s_dash_info_us;   /* when the edition behind those strings landed (the dash section's s_dash_ok_us, copied by render_dash) */
 static bool s_clock_mode;              /* the face shows the clock */
 static bool s_clock_shown;             /* the clock box is up right now */
 static volatile int s_face_toggles;    /* yellow presses, applied in the LVGL task */
@@ -261,6 +269,29 @@ static float s_care_food_from, s_care_food_until;
 static lv_obj_t *s_acc_bell, *s_acc_ribbon_l, *s_acc_ribbon_r, *s_acc_ribbon_c;
 static int s_acc_stage = -1;           /* the stage the face size/accessories show */
 static void care_open_panel(void);     /* below update_quick() */
+/* dev.16: the countdown timer (the section after update_care()). The
+ * dialled length and the state live here; the finish is timed by an
+ * esp_timer so it lands while the watch sleeps, and its callback only
+ * flags it and wakes the screen — update_timer() does the rest. */
+static lv_obj_t *s_timer_panel, *s_timer_time, *s_timer_state, *s_timer_main_lbl, *s_timer_cancel_btn;
+static lv_obj_t *s_timer_alert, *s_timer_alert_time;
+static bool s_timer_open;
+static volatile int s_timer_open_reqs;   /* muse_ui_request_timer(), any task */
+static int s_timer_open_done;
+static volatile bool s_timer_fired;      /* set by the esp_timer callback */
+static esp_timer_handle_t s_timer_esp;
+static int64_t s_timer_end_us;           /* when the running timer ends; 0 = not running */
+static int s_timer_left_s;               /* the seconds left, while paused */
+static int s_timer_set_s = 180;          /* the dialled length */
+static bool s_timer_paused;
+static float s_timer_alert_until;        /* the alert overlay's deadline, frame time */
+static float s_timer_alert_last;         /* the last alert pulse/chirp, frame time */
+static int timer_left_s(void);           /* below update_care(); -1 while not counting */
+/* dev.16: the yellow button's long-press assignment (Settings > Yellow
+ * button), in the care NVS handle beside face_mode. The action defaults
+ * to the timer; the app id matters only for MUSE_YEL_LONG_APP. */
+static uint8_t s_yel_long_act;           /* MUSE_YEL_LONG_* (muse_ui.h) */
+static char s_yel_long_app[24];
 #endif
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 /*
@@ -356,6 +387,9 @@ static void care_load(void)
         if (nvs_get_u16(s_care_nvs, "care_bond", &bond) == ESP_OK) s_care.bond = bond;
         if (nvs_get_u32(s_care_nvs, "care_ts", &ts) == ESP_OK) s_care.anchor = ts;
         if (nvs_get_u8(s_care_nvs, "face_mode", &b) == ESP_OK) s_clock_mode = b != 0;
+        if (nvs_get_u8(s_care_nvs, "yel_l_act", &b) == ESP_OK && b <= MUSE_YEL_LONG_NONE) s_yel_long_act = b;
+        size_t yn = sizeof(s_yel_long_app);
+        if (nvs_get_str(s_care_nvs, "yel_l_app", s_yel_long_app, &yn) != ESP_OK) s_yel_long_app[0] = '\0';
     }
     care_settle();   /* the time away since the last save counts too */
 }
@@ -382,6 +416,39 @@ bool muse_ui_toggle_face_mode(void)
 bool muse_ui_clock_mode(void)
 {
     return s_clock_mode;
+}
+
+/* dev.16: the yellow button's long-press assignment. The getters settle
+ * the load first (care_load opens the shared NVS handle); the setter
+ * saves at once, like every other setting. */
+int muse_ui_yellow_long_action(void)
+{
+    care_load();
+    return s_yel_long_act;
+}
+
+const char *muse_ui_yellow_long_app(void)
+{
+    care_load();
+    return s_yel_long_app;
+}
+
+void muse_ui_set_yellow_long(int action, const char *app_id)
+{
+    care_load();
+    s_yel_long_act = action >= 0 && action <= MUSE_YEL_LONG_NONE ? (uint8_t)action : MUSE_YEL_LONG_TIMER;
+    snprintf(s_yel_long_app, sizeof(s_yel_long_app), "%s", app_id ? app_id : "");
+    if (s_care_nvs) {
+        nvs_set_u8(s_care_nvs, "yel_l_act", s_yel_long_act);
+        nvs_set_str(s_care_nvs, "yel_l_app", s_yel_long_app);
+        nvs_commit(s_care_nvs);
+    }
+}
+
+/* dev.16: a timer-open request (any task); update_timer() applies it. */
+void muse_ui_request_timer(void)
+{
+    s_timer_open_reqs++;
 }
 #endif
 /* The avatar's resting size: on the StopWatch a cared-for avatar grows a
@@ -1638,6 +1705,14 @@ static void on_quick_settings(lv_event_t *e)
     }
 }
 
+/* dev.16: the countdown timer's door on this tile (the launcher's cell
+ * and the yellow button's long press are the other two). */
+static void on_quick_timer(lv_event_t *e)
+{
+    (void)e;
+    muse_ui_request_timer();
+}
+
 static lv_obj_t *quick_slider(lv_obj_t *tile, const lv_font_t *font, const char *name, int y,
                               int min, int max, int val, lv_event_cb_t cb, lv_obj_t **val_out)
 {
@@ -1688,8 +1763,11 @@ static void build_quick(lv_obj_t *tile)
         s_quick_snd_lbl[mode] = l;
     }
     lv_obj_t *settings = hist_button(tile, font, "設定", on_quick_settings);
-    lv_obj_set_size(settings, 160, 48);
-    lv_obj_align(settings, LV_ALIGN_TOP_MID, 0, 356);
+    lv_obj_set_size(settings, 150, 48);
+    lv_obj_align(settings, LV_ALIGN_TOP_MID, -80, 356);
+    lv_obj_t *timer = hist_button(tile, font, "タイマー", on_quick_timer);
+    lv_obj_set_size(timer, 150, 48);
+    lv_obj_align(timer, LV_ALIGN_TOP_MID, 80, 356);
     lv_obj_t *hint = make_label(tile, font, COLOR_DIM);
     lv_label_set_text(hint, "上にスワイプでもどる");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -30);
@@ -1960,7 +2038,22 @@ static void build_clock(lv_obj_t *face)
     lv_obj_set_style_pad_top(s_clock_time, clock_pad, 0);
     lv_obj_set_style_pad_bottom(s_clock_time, clock_pad, 0);
     s_clock_date = make_label(s_clock_box, caption_font(), COLOR_LIT);
-    s_clock_batt = make_label(s_clock_box, caption_font(), COLOR_DIM);
+    /* dev.16: under the date, the edition's weather and next event in
+     * small type, and the running timer's remaining time. No battery
+     * row: the face's header chrome already shows it (the user pointed
+     * out the duplication), so dev.14's row here is gone. */
+    s_clock_wx = make_label(s_clock_box, caption_font(), COLOR_LIT);
+    lv_obj_set_size(s_clock_wx, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_clock_wx, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_clock_wx, LV_LABEL_LONG_MODE_DOTS);
+    s_clock_next = make_label(s_clock_box, caption_font(), COLOR_DIM);
+    lv_obj_set_size(s_clock_next, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_clock_next, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_clock_next, LV_LABEL_LONG_MODE_DOTS);
+    s_clock_timer = make_label(s_clock_box, caption_font(), COLOR_ACCENT);
+    lv_obj_set_size(s_clock_timer, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_clock_timer, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_clock_timer, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_add_flag(s_clock_box, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -2012,15 +2105,23 @@ static void update_face_mode(void)
     if (strcmp(buf, lv_label_get_text(s_clock_date)) != 0) {
         lv_label_set_text(s_clock_date, buf);
     }
-    muse_power_t power = muse_state_power();
-    if (power.battery_pct >= 0) {
-        snprintf(buf, sizeof(buf), power.charging ? "充電中 %d%%" : "バッテリー %d%%", power.battery_pct);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", power.usb ? "USB給電中" : "");
+    /* dev.16: the edition's weather and next event under the date —
+     * render_dash() keeps the two strings; they show only while an
+     * edition is cached and the last good fetch is under a day old, so
+     * a stale edition never dresses itself up as today's. The timer
+     * row is update_timer()'s. (dev.14's battery row left with dev.16:
+     * the header chrome shows the battery already.) */
+    bool fresh = s_dash_info_us && esp_timer_get_time() - s_dash_info_us < 24LL * 3600 * 1000 * 1000;
+    const char *wx = fresh ? s_dash_wx : "";
+    const char *nx = fresh ? s_dash_next : "";
+    if (strcmp(wx, lv_label_get_text(s_clock_wx)) != 0) {
+        lv_label_set_text(s_clock_wx, wx);
     }
-    if (strcmp(buf, lv_label_get_text(s_clock_batt)) != 0) {
-        lv_label_set_text(s_clock_batt, buf);
+    lv_obj_set_flag(s_clock_wx, LV_OBJ_FLAG_HIDDEN, !wx[0]);
+    if (strcmp(nx, lv_label_get_text(s_clock_next)) != 0) {
+        lv_label_set_text(s_clock_next, nx);
     }
+    lv_obj_set_flag(s_clock_next, LV_OBJ_FLAG_HIDDEN, !nx[0]);
 }
 
 /* Place the evolution accessories over the sprite: the bell at grid
@@ -2114,6 +2215,301 @@ static void update_care(float now)
         move_muse(face_px(), s_big_y);
     }
     s_acc_stage = stage;
+}
+
+/*
+ * dev.16: the countdown timer.
+ *
+ * A panel over the face (built beside the care panel): dial a length
+ * with the -1/+1/+5/+10 minute buttons, start it, pause or cancel it.
+ * It is reached three ways — the quick tile's タイマー button, the
+ * launcher's built-in cell, and the yellow button's long press (its
+ * default action) — all through muse_ui_request_timer(). The finish
+ * is timed by an esp_timer, not by the frame tick, so it lands while
+ * the watch sleeps: the callback only flags it and wakes the screen
+ * (muse_state_set_asleep(false) ends the Wi-Fi nap too, the way a
+ * delivery does), and update_timer() — the first frame back — puts
+ * the alert up big on the face and sounds it by the sound mode: chirps
+ * (the voice task's, never speech) and motor pulses when sound is on,
+ * pulses only in vibrate mode, the screen alone when off. The alert
+ * repeats for up to 30 s; a tap on it, or the deadline, ends it. While
+ * the timer counts, the clock face carries its remaining time as a
+ * small row (update_timer, below).
+ */
+static void timer_fmt(char *buf, size_t cap, int secs)
+{
+    snprintf(buf, cap, "%d:%02d", secs / 60, secs % 60);
+}
+
+static int timer_left_s(void)
+{
+    if (s_timer_end_us) {
+        int64_t left = (s_timer_end_us - esp_timer_get_time()) / 1000000;
+        return left > 0 ? (int)left : 0;
+    }
+    return s_timer_paused ? s_timer_left_s : -1;
+}
+
+static void timer_esp_cb(void *arg)
+{
+    (void)arg;
+    s_timer_fired = true;
+    muse_state_set_asleep(false);   /* wake: the alert is the point */
+}
+
+static void timer_arm(void)
+{
+    if (!s_timer_esp) {
+        const esp_timer_create_args_t args = { .callback = timer_esp_cb, .name = "timer" };
+        if (esp_timer_create(&args, &s_timer_esp) != ESP_OK) {
+            s_timer_esp = NULL;
+            return;
+        }
+    }
+    esp_timer_stop(s_timer_esp);
+    int64_t left = s_timer_end_us - esp_timer_get_time();
+    if (left > 0) {
+        esp_timer_start_once(s_timer_esp, (uint64_t)left);
+    }
+}
+
+static void timer_refresh(bool force)
+{
+    static int shown_s = -1, shown_state = -1;
+    int state = s_timer_end_us ? 2 : s_timer_paused ? 1 : 0;   /* set / paused / running */
+    int secs = state == 2 ? timer_left_s() : state == 1 ? s_timer_left_s : s_timer_set_s;
+    if (!force && secs == shown_s && state == shown_state) {
+        return;
+    }
+    shown_s = secs;
+    shown_state = state;
+    char buf[16];
+    timer_fmt(buf, sizeof(buf), secs);
+    lv_label_set_text(s_timer_time, buf);
+    lv_label_set_text(s_timer_state, state == 2 ? "計測中" : state == 1 ? "一時停止中" : "セット中");
+    lv_label_set_text(s_timer_main_lbl, state == 2 ? "一時停止" : state == 1 ? "再開" : "スタート");
+    lv_obj_set_flag(s_timer_cancel_btn, LV_OBJ_FLAG_HIDDEN, state == 0);
+}
+
+static void timer_close_panel(void)
+{
+    s_timer_open = false;
+    lv_obj_add_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_timer_close(lv_event_t *e)
+{
+    (void)e;
+    timer_close_panel();
+}
+
+static void on_timer_add(lv_event_t *e)
+{
+    if (s_timer_end_us || s_timer_paused) {
+        return;   /* the dial is for a fresh timer */
+    }
+    int add = (int)(intptr_t)lv_event_get_user_data(e);
+    s_timer_set_s += add;
+    if (s_timer_set_s < 60) s_timer_set_s = 60;
+    if (s_timer_set_s > 5999) s_timer_set_s = 5999;
+    timer_refresh(true);
+}
+
+static void on_timer_main(lv_event_t *e)
+{
+    (void)e;
+    if (s_timer_end_us) {   /* pause: freeze what is left */
+        s_timer_left_s = timer_left_s();
+        s_timer_end_us = 0;
+        s_timer_paused = true;
+        if (s_timer_esp) esp_timer_stop(s_timer_esp);
+    } else if (s_timer_paused) {   /* resume */
+        s_timer_end_us = esp_timer_get_time() + (int64_t)s_timer_left_s * 1000000;
+        s_timer_paused = false;
+        timer_arm();
+    } else {   /* start */
+        s_timer_end_us = esp_timer_get_time() + (int64_t)s_timer_set_s * 1000000;
+        timer_arm();
+    }
+    timer_refresh(true);
+}
+
+static void on_timer_cancel(lv_event_t *e)
+{
+    (void)e;
+    s_timer_end_us = 0;
+    s_timer_paused = false;
+    if (s_timer_esp) esp_timer_stop(s_timer_esp);
+    timer_refresh(true);
+}
+
+static void on_timer_alert_tap(lv_event_t *e)
+{
+    (void)e;
+    s_timer_alert_until = 0;
+    lv_obj_add_flag(s_timer_alert, LV_OBJ_FLAG_HIDDEN);
+}
+
+static lv_obj_t *timer_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *ud, lv_obj_t **lbl_out)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x241d40), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_t *l = make_label(b, caption_font(), COLOR_LIT);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    if (lbl_out) {
+        *lbl_out = l;
+    }
+    return b;
+}
+
+static void build_timer(lv_obj_t *face)
+{
+    const lv_font_t *font = caption_font();
+    s_timer_panel = lv_obj_create(face);
+    lv_obj_remove_style_all(s_timer_panel);
+    lv_obj_remove_flag(s_timer_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_timer_panel, 344, 372);
+    lv_obj_center(s_timer_panel);
+    lv_obj_set_style_bg_color(s_timer_panel, lv_color_hex(COLOR_CARD_BG), 0);
+    lv_obj_set_style_bg_opa(s_timer_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_timer_panel, 24, 0);
+    lv_obj_add_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *title = make_label(s_timer_panel, font, COLOR_LIT);
+    lv_label_set_text(title, "タイマー");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    s_timer_time = make_label(s_timer_panel, FONT_CLOCK, 0xffffff);
+    lv_label_set_text(s_timer_time, "3:00");
+    lv_obj_align(s_timer_time, LV_ALIGN_TOP_MID, 0, 52);
+    s_timer_state = make_label(s_timer_panel, font, COLOR_DIM);
+    lv_obj_align(s_timer_state, LV_ALIGN_TOP_MID, 0, 128);
+    static const struct { const char *t; int add; } ADDS[4] = {
+        { "-1分", -60 }, { "+1分", 60 }, { "+5分", 300 }, { "+10分", 600 },
+    };
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = timer_button(s_timer_panel, ADDS[i].t, on_timer_add,
+                                   (void *)(intptr_t)ADDS[i].add, NULL);
+        lv_obj_set_size(b, 76, 48);
+        lv_obj_align(b, LV_ALIGN_TOP_MID, (i * 2 - 3) * 42, 164);
+    }
+    lv_obj_t *main_btn = timer_button(s_timer_panel, "スタート", on_timer_main, NULL, &s_timer_main_lbl);
+    lv_obj_set_size(main_btn, 150, 54);
+    lv_obj_align(main_btn, LV_ALIGN_TOP_MID, -80, 230);
+    s_timer_cancel_btn = timer_button(s_timer_panel, "キャンセル", on_timer_cancel, NULL, NULL);
+    lv_obj_set_size(s_timer_cancel_btn, 150, 54);
+    lv_obj_align(s_timer_cancel_btn, LV_ALIGN_TOP_MID, 80, 230);
+    lv_obj_t *close = timer_button(s_timer_panel, "閉じる", on_timer_close, NULL, NULL);
+    lv_obj_set_size(close, 128, 48);
+    lv_obj_align(close, LV_ALIGN_TOP_MID, 0, 302);
+    timer_refresh(true);
+
+    /* The finished alert: the dialled length big, a tap ends it. The
+     * title is the 16 px CJK font at 200% through a transform, the
+     * clock face's trick (dev.15), with the scaled height reserved. */
+    s_timer_alert = lv_obj_create(face);
+    lv_obj_remove_style_all(s_timer_alert);
+    lv_obj_remove_flag(s_timer_alert, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_timer_alert, 360, 236);
+    lv_obj_center(s_timer_alert);
+    lv_obj_set_style_bg_color(s_timer_alert, lv_color_hex(COLOR_CARD_BG), 0);
+    lv_obj_set_style_bg_opa(s_timer_alert, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_timer_alert, 24, 0);
+    lv_obj_set_style_border_width(s_timer_alert, 3, 0);
+    lv_obj_set_style_border_color(s_timer_alert, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_add_flag(s_timer_alert, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_timer_alert, on_timer_alert_tap, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *done = make_label(s_timer_alert, font, COLOR_LIT);
+    lv_label_set_text(done, "タイマー終了");
+    lv_obj_set_style_transform_scale_x(done, 512, 0);
+    lv_obj_set_style_transform_scale_y(done, 512, 0);
+    lv_obj_set_style_transform_pivot_x(done, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(done, lv_pct(50), 0);
+    int done_pad = lv_font_get_line_height(font) / 2;
+    lv_obj_set_style_pad_top(done, done_pad, 0);
+    lv_obj_set_style_pad_bottom(done, done_pad, 0);
+    lv_obj_align(done, LV_ALIGN_TOP_MID, 0, 26);
+    s_timer_alert_time = make_label(s_timer_alert, FONT_CLOCK, 0xffffff);
+    lv_obj_align(s_timer_alert_time, LV_ALIGN_TOP_MID, 0, 96);
+    lv_obj_t *hint = make_label(s_timer_alert, font, COLOR_DIM);
+    lv_label_set_text(hint, "タップで止める");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_obj_add_flag(s_timer_alert, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_timer(float now)
+{
+    if (!s_timer_panel) {
+        return;
+    }
+    /* Open requests: the face comes forward and the panel opens (the
+     * care panel gives way; a running timer keeps running). */
+    while (s_timer_open_done != s_timer_open_reqs) {
+        s_timer_open_done++;
+        if (s_tv && s_face) {
+            lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+        }
+        care_close_panel();
+        s_timer_open = true;
+        lv_obj_remove_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_timer_panel);
+        timer_refresh(true);
+    }
+    /* The esp_timer fired while the frame tick slept: the alert. */
+    if (s_timer_fired) {
+        s_timer_fired = false;
+        s_timer_end_us = 0;
+        s_timer_paused = false;
+        if (s_tv && s_face) {
+            lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+        }
+        care_close_panel();
+        timer_close_panel();
+        char buf[16];
+        timer_fmt(buf, sizeof(buf), s_timer_set_s);
+        lv_label_set_text(s_timer_alert_time, buf);
+        lv_obj_remove_flag(s_timer_alert, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_timer_alert);
+        s_timer_alert_until = now + 30.0f;
+        s_timer_alert_last = 0;
+        timer_refresh(true);
+    }
+    if (s_timer_alert_until > 0) {
+        if (now >= s_timer_alert_until) {
+            s_timer_alert_until = 0;
+            lv_obj_add_flag(s_timer_alert, LV_OBJ_FLAG_HIDDEN);
+        } else if (now - s_timer_alert_last >= 1.2f) {
+            s_timer_alert_last = now;
+            int mode = muse_settings_sound_mode();
+            if (mode != MUSE_SOUND_OFF) {
+                muse_review_pulse();   /* the motor, in the modes that have it */
+            }
+            if (mode == MUSE_SOUND_ON) {
+                muse_voice_request_chirp();   /* a chirp, never speech */
+            }
+        }
+    }
+    if (s_timer_open) {
+        timer_refresh(false);
+    }
+    /* The clock face's timer row: what is left, while it counts. */
+    if (s_clock_timer) {
+        int left = timer_left_s();
+        char buf[40] = "";
+        if (left >= 0) {
+            char t[16];
+            timer_fmt(t, sizeof(t), left);
+            snprintf(buf, sizeof(buf), "タイマー %s", t);
+        }
+        if (strcmp(buf, lv_label_get_text(s_clock_timer)) != 0) {
+            lv_label_set_text(s_clock_timer, buf);
+        }
+        lv_obj_set_flag(s_clock_timer, LV_OBJ_FLAG_HIDDEN, !buf[0]);
+    }
 }
 
 /*
@@ -2464,6 +2860,33 @@ static void render_dash(void)
         const char *kn = !strcmp(k, "morning") ? "朝版" : !strcmp(k, "evening") ? "夕版" : "";
         const char *up = cJSON_IsString(updated) ? updated->valuestring : "";
         snprintf(sub, sizeof(sub), "%s%s%s", kn, kn[0] && up[0] ? "  " : "", up);
+    }
+    /* dev.16: the clock face's two small lines come from these same
+     * sections — the weather section's first line, and the schedule
+     * section's first line as the next event. update_face_mode() shows
+     * them only while the fetch behind them is fresh. */
+    s_dash_wx[0] = '\0';
+    s_dash_next[0] = '\0';
+    s_dash_info_us = root ? s_dash_ok_us : 0;
+    cJSON *secs0 = root ? cJSON_GetObjectItemCaseSensitive(root, "sections") : NULL;
+    if (cJSON_IsArray(secs0)) {
+        cJSON *sec;
+        cJSON_ArrayForEach(sec, secs0) {
+            cJSON *t = cJSON_GetObjectItemCaseSensitive(sec, "t");
+            cJSON *lines = cJSON_GetObjectItemCaseSensitive(sec, "lines");
+            const char *title = cJSON_IsString(t) ? t->valuestring : "";
+            cJSON *first = cJSON_IsArray(lines) && cJSON_GetArraySize(lines) > 0
+                               ? cJSON_GetArrayItem(lines, 0) : NULL;
+            const char *line = cJSON_IsString(first) ? first->valuestring : "";
+            if (!line[0]) {
+                continue;
+            }
+            if (!s_dash_wx[0] && strstr(title, "天気")) {
+                snprintf(s_dash_wx, sizeof(s_dash_wx), "%s", line);
+            } else if (!s_dash_next[0] && strstr(title, "予定")) {
+                snprintf(s_dash_next, sizeof(s_dash_next), "次: %s", line);
+            }
+        }
     }
     if (strcmp(sub, lv_label_get_text(s_dash_sub)) != 0) {
         lv_label_set_text(s_dash_sub, sub);
@@ -2955,6 +3378,7 @@ static void build_screen(void)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     build_care(face);    /* dev.14: the care panel, food and accessories */
     build_clock(face);   /* dev.14: the yellow button's clock face */
+    build_timer(face);   /* dev.16: the countdown timer panel and its alert */
 #endif
 }
 
@@ -3838,6 +4262,7 @@ static void frame_tick(lv_timer_t *timer)
     update_dash();
     update_face_mode();   /* dev.14: yellow-button presses, the clock face */
     update_care(now);     /* dev.14: care meters, food, accessories, growth */
+    update_timer(now);    /* dev.16: timer opens, the fired alert, the clock row */
 #endif
     if (s_tv && lv_obj_get_scroll_x(s_tv) != face_scroll_x()) {
         /* Off screen, or sliding to or from settings: hold still so the

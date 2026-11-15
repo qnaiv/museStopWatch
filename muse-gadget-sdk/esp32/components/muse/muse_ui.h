@@ -45,6 +45,18 @@ void muse_ui_show_face(void);
 bool muse_ui_toggle_face_mode(void);
 /* From any task: the face currently shows the clock. */
 bool muse_ui_clock_mode(void);
+/* museStopWatch dev.16: open the countdown timer (the quick tile's
+ * button, the launcher's built-in cell, the yellow button's long press).
+ * From any task: the request is counted here and applied in the LVGL
+ * task (the face tile comes forward and the timer panel opens). */
+void muse_ui_request_timer(void);
+/* museStopWatch dev.16: the yellow button's long-press assignment
+ * (Settings > Yellow button), kept in NVS across reboots. A short press
+ * always switches the face (dev.14); only the hold is assignable. */
+enum { MUSE_YEL_LONG_TIMER = 0, MUSE_YEL_LONG_APP = 1, MUSE_YEL_LONG_FACE = 2, MUSE_YEL_LONG_NONE = 3 };
+int muse_ui_yellow_long_action(void);
+const char *muse_ui_yellow_long_app(void);   /* the app id for MUSE_YEL_LONG_APP */
+void muse_ui_set_yellow_long(int action, const char *app_id);
 #endif
 /* Settings sub-pages turn off the tile swipe so they can use horizontal gestures. */
 void muse_ui_set_swipe_enabled(bool enabled);
