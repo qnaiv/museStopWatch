@@ -1,4 +1,6 @@
 # museStopWatch overlay (loaded last, after sdkconfig.muse-m5stack-stopwatch).
+# dev.14: the yellow button's clock face sets the time in Montserrat 48.
+CONFIG_LV_FONT_MONTSERRAT_48=y
 # Japanese replies need the CJK caption font (GNU Unifont, kana + all CJK ideographs).
 CONFIG_MUSE_CJK_FONT=y
 # Settings > QR (AP Mode QR / Web QR) draws its codes with LVGL's QR widget.

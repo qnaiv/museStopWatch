@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -58,6 +59,7 @@
 #endif
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 #include "cJSON.h"   /* museStopWatch: the dashboard edition is JSON */
+#include "nvs.h"     /* museStopWatch: the care state and face mode (dev.14) */
 #endif
 #if CONFIG_MUSE_WATCHER_CAMERA
 #include "boards/watcher_camera.h"
@@ -221,6 +223,10 @@ static lv_obj_t *s_name_lbl;    /* this gadget's own name, to tell it from the n
 static lv_obj_t *s_cv_lbl;      /* museStopWatch: "CV: ..." while voice.play's voice speaks */
 /* museStopWatch: the voice's name while voice.play's audio is heard (main/msw_play.c). */
 const char *msw_voice_credit(void) __attribute__((weak));
+/* museStopWatch: the local time (muse_diy_stopwatch/ui/msw_time.c, JST,
+ * RTC-backed); false until the clock is set. dev.14's care meters settle
+ * against it, and the clock face reads it. */
+bool msw_time_now(struct tm *local) __attribute__((weak));
 static lv_obj_t *s_power_lbl;
 static lv_obj_t *s_caption_lbl;
 static int s_cap_h, s_cap_y;   /* the caption's built height and centre offset, to restore it */
@@ -230,7 +236,164 @@ static float s_full_since;     /* when the kept reply went up (auto-clears secon
 static lv_obj_t *s_quick_bright, *s_quick_bright_val, *s_quick_vol, *s_quick_vol_val;
 static lv_obj_t *s_ask_ok, *s_ask_no;   /* approval buttons over a question's kept reply */
 static bool s_ask_shown;
+/* dev.14: the quick tile's sound-mode buttons (the yellow button's old job). */
+static lv_obj_t *s_quick_snd[3];
+static lv_obj_t *s_quick_snd_lbl[3];
+static int s_quick_snd_shown = -1;
+/* dev.14: the clock face the yellow button switches to, and the care
+ * (tamagotchi) panel over the avatar. Built in the section after
+ * update_quick(); the state itself lives just below. */
+#if LV_FONT_MONTSERRAT_48
+#define FONT_CLOCK (&lv_font_montserrat_48)
+#else
+#define FONT_CLOCK (&lv_font_montserrat_28)
 #endif
+static lv_obj_t *s_clock_box, *s_clock_time, *s_clock_date, *s_clock_batt;
+static bool s_clock_mode;              /* the face shows the clock */
+static bool s_clock_shown;             /* the clock box is up right now */
+static volatile int s_face_toggles;    /* yellow presses, applied in the LVGL task */
+static int s_face_toggles_done;
+static lv_obj_t *s_care_panel, *s_care_head;
+static lv_obj_t *s_care_belly_fill, *s_care_belly_val, *s_care_mood_fill, *s_care_mood_val;
+static lv_obj_t *s_care_food;
+static bool s_care_open;
+static float s_care_food_from, s_care_food_until;
+static lv_obj_t *s_acc_bell, *s_acc_ribbon_l, *s_acc_ribbon_r, *s_acc_ribbon_c;
+static int s_acc_stage = -1;           /* the stage the face size/accessories show */
+static void care_open_panel(void);     /* below update_quick() */
+#endif
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/*
+ * dev.14: the avatar's care state — the tamagotchi under the care panel.
+ *
+ * Belly and mood (0..100) drain slowly against the wall clock; feeding
+ * and petting (the panel, below update_quick()) refill them and add to
+ * the lifetime bond, whose thresholds are the three evolution stages.
+ * Everything persists in the "muse" NVS namespace under care_* keys,
+ * plus face_mode for the yellow button's clock face. The state lives in
+ * this file, not muse_settings.c: the settings host harness pins that
+ * file's NVS writes to its own keys. Decay settles only in whole points
+ * and the anchor advances by exactly the settled span, so settling
+ * often (panel opens, feeds, a once-a-minute pass in the tick) never
+ * loses or double-counts time; while the clock is unset nothing decays.
+ */
+#define CARE_FULL 100
+#define CARE_POINT_SECS 600    /* one point of belly/mood per ten minutes */
+#define CARE_STAGE2_BOND 50
+#define CARE_STAGE3_BOND 150
+
+static struct {
+    bool loaded;
+    uint8_t belly, mood;   /* 0..CARE_FULL */
+    uint16_t bond;         /* lifetime affection points */
+    uint32_t anchor;       /* the epoch the meters were last settled at */
+} s_care;
+static nvs_handle_t s_care_nvs;
+
+static bool care_now(uint32_t *out)
+{
+    struct tm local;
+    if (!msw_time_now || !msw_time_now(&local)) {
+        return false;   /* the clock is not set yet */
+    }
+    *out = (uint32_t)time(NULL);
+    return true;
+}
+
+static void care_settle(void)
+{
+    uint32_t now;
+    if (!care_now(&now)) {
+        return;
+    }
+    if (!s_care.anchor || now <= s_care.anchor) {
+        s_care.anchor = now;   /* first run, or the clock stepped back */
+        return;
+    }
+    uint32_t away = now - s_care.anchor;
+    if (away > 7u * 24 * 3600) {
+        away = 7u * 24 * 3600;   /* a week away empties the meters, no more */
+    }
+    uint32_t points = away / CARE_POINT_SECS;
+    if (!points) {
+        return;
+    }
+    s_care.belly = points >= s_care.belly ? 0 : s_care.belly - points;
+    s_care.mood = points >= s_care.mood ? 0 : s_care.mood - points;
+    s_care.anchor += points * CARE_POINT_SECS;
+}
+
+static void care_save(void)
+{
+    if (!s_care_nvs) {
+        return;
+    }
+    nvs_set_u8(s_care_nvs, "care_belly", s_care.belly);
+    nvs_set_u8(s_care_nvs, "care_mood", s_care.mood);
+    nvs_set_u16(s_care_nvs, "care_bond", s_care.bond);
+    nvs_set_u32(s_care_nvs, "care_ts", s_care.anchor);
+    nvs_set_u8(s_care_nvs, "face_mode", s_clock_mode ? 1 : 0);
+    nvs_commit(s_care_nvs);
+}
+
+static void care_load(void)
+{
+    if (s_care.loaded) {
+        return;
+    }
+    s_care.loaded = true;
+    s_care.belly = 80;   /* a new avatar starts fed and cheerful */
+    s_care.mood = 80;
+    if (nvs_open("muse", NVS_READWRITE, &s_care_nvs) != ESP_OK) {
+        s_care_nvs = 0;   /* RAM only this boot */
+    }
+    if (s_care_nvs) {
+        uint8_t b;
+        uint16_t bond;
+        uint32_t ts;
+        if (nvs_get_u8(s_care_nvs, "care_belly", &b) == ESP_OK && b <= CARE_FULL) s_care.belly = b;
+        if (nvs_get_u8(s_care_nvs, "care_mood", &b) == ESP_OK && b <= CARE_FULL) s_care.mood = b;
+        if (nvs_get_u16(s_care_nvs, "care_bond", &bond) == ESP_OK) s_care.bond = bond;
+        if (nvs_get_u32(s_care_nvs, "care_ts", &ts) == ESP_OK) s_care.anchor = ts;
+        if (nvs_get_u8(s_care_nvs, "face_mode", &b) == ESP_OK) s_clock_mode = b != 0;
+    }
+    care_settle();   /* the time away since the last save counts too */
+}
+
+/* 0, 1 or 2: the evolution stage the lifetime bond has reached. */
+static int care_stage(void)
+{
+    care_load();
+    return s_care.bond >= CARE_STAGE3_BOND ? 2 : s_care.bond >= CARE_STAGE2_BOND ? 1 : 0;
+}
+
+/* The yellow button (muse_input.c, any task): count the press; the LVGL
+ * task applies it in update_face_mode(). Returns the face the press is
+ * taking the watch to (true: the clock), for the button's hint. */
+bool muse_ui_toggle_face_mode(void)
+{
+    care_load();
+    int pending = s_face_toggles - s_face_toggles_done;
+    bool target = s_clock_mode ^ (pending & 1) ^ 1;
+    s_face_toggles++;
+    return target;
+}
+
+bool muse_ui_clock_mode(void)
+{
+    return s_clock_mode;
+}
+#endif
+/* The avatar's resting size: on the StopWatch a cared-for avatar grows a
+ * little per evolution stage (dev.14); everywhere else the canvas size. */
+static int face_px(void)
+{
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    return s_canvas_px * (100 + 6 * care_stage()) / 100;
+#else
+    return s_canvas_px;
+#endif
+}
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
 static lv_obj_t *s_review_position;
@@ -607,6 +770,20 @@ static void build_button_icons(lv_obj_t *face)
 static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* dev.14: a tap on the avatar opens its care panel — but only while
+     * the face is the avatar's alone. While a reply is up (the caption,
+     * the read layout, a kept full reply, a question's buttons) the tap
+     * keeps its old meaning and never opens the panel; in clock mode the
+     * canvas is hidden and cannot be tapped at all. */
+    if (!s_care_open && !s_clock_mode
+        && lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
+        && (!s_reply_lbl || lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN))
+        && !s_full_lbl && !muse_state_ask_pending() && !muse_state_hint_pending()) {
+        care_open_panel();
+        return;
+    }
+#endif
     muse_state_make_happy();
 }
 
@@ -936,7 +1113,7 @@ static void set_answer(int which)
         lv_obj_align(s_reply_lbl, LV_ALIGN_CENTER, 0, l->top + l->h / 2);
         lv_obj_set_style_text_align(s_reply_lbl, l->align, 0);
     }
-    move_muse(l ? l->px : s_canvas_px, l ? l->y : s_big_y);
+    move_muse(l ? l->px : face_px(), l ? l->y : s_big_y);
 }
 
 /* Whether a reply `w` px wide fits across the screen `y` px from the centre. */
@@ -1428,9 +1605,10 @@ static void update_history(void)
 /*
  * The quick settings tile (above the face, swipe down for it): the two
  * sliders a hand reaches for most — brightness and volume — applied as
- * they move (update_power and the audio path poll the settings). Avatar
- * switching used to live on the tile below the face; it is in Settings
- * now, and the reply history took that tile's place.
+ * they move (update_power and the audio path poll the settings), and
+ * (dev.14) the three sound-mode buttons. Avatar switching used to live
+ * on the tile below the face; it is in Settings now, and the reply
+ * history took that tile's place.
  */
 static void on_quick_bright(lv_event_t *e)
 {
@@ -1440,6 +1618,14 @@ static void on_quick_bright(lv_event_t *e)
 static void on_quick_vol(lv_event_t *e)
 {
     muse_settings_set_volume((int)lv_slider_get_value(lv_event_get_target(e)));
+}
+
+/* dev.14: the sound modes moved here from the yellow button (it switches
+ * the face now) — the same snd_mode setting Settings and the speaker rim
+ * icon read, saved the moment a button is tapped. */
+static void on_quick_snd(lv_event_t *e)
+{
+    muse_settings_set_sound_mode((int)(intptr_t)lv_event_get_user_data(e));
 }
 
 /* Settings lives one tile past the dashboard now; this button is its door
@@ -1475,22 +1661,44 @@ static void build_quick(lv_obj_t *tile)
     const lv_font_t *font = caption_font();
     lv_obj_t *title = make_label(tile, font, COLOR_LIT);
     lv_label_set_text(title, "クイック設定");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 44);
-    s_quick_bright = quick_slider(tile, font, "明るさ", 104, 10, 100, muse_settings_brightness(),
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
+    s_quick_bright = quick_slider(tile, font, "明るさ", 82, 10, 100, muse_settings_brightness(),
                                   on_quick_bright, &s_quick_bright_val);
-    s_quick_vol = quick_slider(tile, font, "音量", 216, 0, 100, muse_settings_volume(),
+    s_quick_vol = quick_slider(tile, font, "音量", 178, 0, 100, muse_settings_volume(),
                                on_quick_vol, &s_quick_vol_val);
+    /* dev.14: the sound modes, three buttons under the sliders — the
+     * live one lit (update_quick keeps them honest). */
+    lv_obj_t *snd = make_label(tile, font, COLOR_LIT);
+    lv_label_set_text(snd, "音モード");
+    lv_obj_align(snd, LV_ALIGN_TOP_MID, 0, 262);
+    static const char *const SND_NAMES[3] = { "ミュート", "振動のみ", "音あり" };   /* by MUSE_SOUND_* */
+    for (int mode = 0; mode < 3; mode++) {
+        lv_obj_t *b = lv_btn_create(tile);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 104, 46);
+        lv_obj_set_style_radius(b, 16, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x241d40), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_t *l = make_label(b, font, COLOR_LIT);
+        lv_label_set_text(l, SND_NAMES[mode]);
+        lv_obj_center(l);
+        lv_obj_align(b, LV_ALIGN_TOP_MID, (1 - mode) * 112, 292);
+        lv_obj_add_event_cb(b, on_quick_snd, LV_EVENT_CLICKED, (void *)(intptr_t)mode);
+        s_quick_snd[mode] = b;
+        s_quick_snd_lbl[mode] = l;
+    }
     lv_obj_t *settings = hist_button(tile, font, "設定", on_quick_settings);
-    lv_obj_set_size(settings, 160, 52);
-    lv_obj_align(settings, LV_ALIGN_TOP_MID, 0, 318);
+    lv_obj_set_size(settings, 160, 48);
+    lv_obj_align(settings, LV_ALIGN_TOP_MID, 0, 356);
     lv_obj_t *hint = make_label(tile, font, COLOR_DIM);
     lv_label_set_text(hint, "上にスワイプでもどる");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -36);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -30);
 }
 
-/* While the quick tile is up, keep its sliders honest (the yellow button
- * and Settings change the same values). A slider being dragged is left
- * alone: its own event applies the value. */
+/* While the quick tile is up, keep its sliders honest (Settings changes
+ * the same values) and the sound buttons lit on the live mode (Settings'
+ * sound page changes it too). A slider being dragged is left alone: its
+ * own event applies the value. */
 static void update_quick(void)
 {
     if (!s_quick || !s_tv || lv_tileview_get_tile_active(s_tv) != s_quick) return;
@@ -1502,11 +1710,397 @@ static void update_quick(void)
         && lv_slider_get_value(s_quick_vol) != muse_settings_volume()) {
         lv_slider_set_value(s_quick_vol, muse_settings_volume(), LV_ANIM_OFF);
     }
+    int snd = muse_settings_sound_mode();
+    if (snd != s_quick_snd_shown) {
+        s_quick_snd_shown = snd;
+        for (int i = 0; i < 3; i++) {
+            bool on = i == snd;
+            lv_obj_set_style_bg_color(s_quick_snd[i], lv_color_hex(on ? COLOR_ACCENT : 0x241d40), 0);
+            lv_obj_set_style_text_color(s_quick_snd_lbl[i], lv_color_hex(on ? 0x17122b : COLOR_LIT), 0);
+        }
+    }
     char buf[16];
     snprintf(buf, sizeof(buf), "%d%%", muse_settings_brightness());
     if (strcmp(buf, lv_label_get_text(s_quick_bright_val)) != 0) lv_label_set_text(s_quick_bright_val, buf);
     snprintf(buf, sizeof(buf), "%d%%", muse_settings_volume());
     if (strcmp(buf, lv_label_get_text(s_quick_vol_val)) != 0) lv_label_set_text(s_quick_vol_val, buf);
+}
+
+/*
+ * dev.14: the care panel and the clock face.
+ *
+ * Tapping the avatar (while no reply is up — see on_canvas_clicked)
+ * opens the care panel: feed or pet みゃおっち, watch its belly/mood
+ * meters and its bond. Feeding and petting close the panel and answer
+ * with the happy pose; feeding also drops food over the avatar while it
+ * eats. The yellow button's clock face is the other half of this
+ * section: big time, date, battery, and nothing else — replies still
+ * take the face over while they run, exactly as on the avatar.
+ */
+
+static void care_refresh(void)
+{
+    static int belly = -1, mood = -1, bond = -1;
+    if ((int)s_care.belly == belly && (int)s_care.mood == mood && (int)s_care.bond == bond) {
+        return;   /* nothing moved: leave the objects alone */
+    }
+    belly = s_care.belly;
+    mood = s_care.mood;
+    bond = s_care.bond;
+    char buf[72];
+    int stage = care_stage();
+    if (stage >= 2) {
+        snprintf(buf, sizeof(buf), "第3段階 ・ 好感度 %u", s_care.bond);
+    } else {
+        int next = stage == 0 ? CARE_STAGE2_BOND : CARE_STAGE3_BOND;
+        snprintf(buf, sizeof(buf), "第%d段階 ・ 好感度 %u（あと%dで進化）",
+                 stage + 1, s_care.bond, next - s_care.bond);
+    }
+    lv_label_set_text(s_care_head, buf);
+    lv_obj_set_width(s_care_belly_fill, s_care.belly ? 14 + (170 - 14) * s_care.belly / CARE_FULL : 0);
+    lv_obj_set_width(s_care_mood_fill, s_care.mood ? 14 + (170 - 14) * s_care.mood / CARE_FULL : 0);
+    snprintf(buf, sizeof(buf), "%d", s_care.belly);
+    lv_label_set_text(s_care_belly_val, buf);
+    snprintf(buf, sizeof(buf), "%d", s_care.mood);
+    lv_label_set_text(s_care_mood_val, buf);
+}
+
+static void care_close_panel(void)
+{
+    s_care_open = false;
+    lv_obj_add_flag(s_care_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_care_close(lv_event_t *e)
+{
+    (void)e;
+    care_close_panel();
+}
+
+static void on_care_feed(lv_event_t *e)
+{
+    (void)e;
+    care_settle();
+    s_care.belly = s_care.belly > CARE_FULL - 30 ? CARE_FULL : s_care.belly + 30;
+    s_care.mood = s_care.mood > CARE_FULL - 5 ? CARE_FULL : s_care.mood + 5;
+    if (s_care.bond < 60000) s_care.bond += 5;
+    care_save();
+    care_refresh();
+    care_close_panel();
+    muse_state_make_happy();   /* the eating face: the happy pose, held a moment */
+    s_care_food_from = (float)esp_timer_get_time() / 1e6f;
+    s_care_food_until = s_care_food_from + 1.2f;
+    lv_obj_remove_flag(s_care_food, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_care_food);
+}
+
+static void on_care_pet(lv_event_t *e)
+{
+    (void)e;
+    care_settle();
+    s_care.mood = s_care.mood > CARE_FULL - 15 ? CARE_FULL : s_care.mood + 15;
+    if (s_care.bond < 60000) s_care.bond += 2;   /* petting earns less bond than feeding */
+    care_save();
+    care_refresh();
+    care_close_panel();
+    muse_state_make_happy();
+}
+
+static void care_open_panel(void)
+{
+    if (!s_care_panel) {
+        return;
+    }
+    care_load();
+    care_settle();
+    care_save();   /* the settled meters are the new baseline */
+    care_refresh();
+    s_care_open = true;
+    lv_obj_remove_flag(s_care_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_care_panel);
+}
+
+/* One meter row: name, a hand-rolled bar (track + fill), the number. */
+static void care_meter(lv_obj_t *panel, const lv_font_t *font, const char *name, int y,
+                       lv_obj_t **fill_out, lv_obj_t **val_out)
+{
+    lv_obj_t *l = make_label(panel, font, COLOR_LIT);
+    lv_label_set_text(l, name);
+    lv_obj_set_pos(l, 28, y);
+    lv_obj_t *track = lv_obj_create(panel);
+    lv_obj_remove_style_all(track);
+    lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(track, 170, 14);
+    lv_obj_set_pos(track, 108, y + 4);
+    lv_obj_set_style_bg_color(track, lv_color_hex(COLOR_METER_OFF), 0);
+    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(track, 7, 0);
+    lv_obj_t *fill = lv_obj_create(track);
+    lv_obj_remove_style_all(fill);
+    lv_obj_remove_flag(fill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(fill, 0, 14);
+    lv_obj_set_style_bg_color(fill, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(fill, 7, 0);
+    lv_obj_t *v = make_label(panel, font, COLOR_DIM);
+    lv_obj_set_pos(v, 288, y);
+    *fill_out = fill;
+    *val_out = v;
+}
+
+/* A plain disc on the face (an accessory part, a food pellet). */
+static lv_obj_t *care_disc(lv_obj_t *parent, uint32_t color)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    return o;
+}
+
+static void build_care(lv_obj_t *face)
+{
+    const lv_font_t *font = caption_font();
+    s_care_panel = lv_obj_create(face);
+    lv_obj_remove_style_all(s_care_panel);
+    lv_obj_remove_flag(s_care_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_care_panel, 344, 356);
+    lv_obj_center(s_care_panel);
+    lv_obj_set_style_bg_color(s_care_panel, lv_color_hex(COLOR_CARD_BG), 0);
+    lv_obj_set_style_bg_opa(s_care_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_care_panel, 24, 0);
+    lv_obj_add_flag(s_care_panel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *title = make_label(s_care_panel, font, COLOR_LIT);
+    lv_label_set_text(title, "みゃおっちのお世話");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    s_care_head = make_label(s_care_panel, font, COLOR_DIM);
+    lv_obj_align(s_care_head, LV_ALIGN_TOP_MID, 0, 52);
+    care_meter(s_care_panel, font, "おなか", 100, &s_care_belly_fill, &s_care_belly_val);
+    care_meter(s_care_panel, font, "ごきげん", 146, &s_care_mood_fill, &s_care_mood_val);
+    lv_obj_t *feed = hist_button(s_care_panel, font, "餌やり", on_care_feed);
+    lv_obj_set_size(feed, 128, 54);
+    lv_obj_align(feed, LV_ALIGN_TOP_MID, -72, 204);
+    lv_obj_t *pet = hist_button(s_care_panel, font, "なでる", on_care_pet);
+    lv_obj_set_size(pet, 128, 54);
+    lv_obj_align(pet, LV_ALIGN_TOP_MID, 72, 204);
+    lv_obj_t *close = hist_button(s_care_panel, font, "閉じる", on_care_close);
+    lv_obj_set_size(close, 128, 48);
+    lv_obj_align(close, LV_ALIGN_TOP_MID, 0, 278);
+
+    /* The food: three pellets that fall over the avatar while it eats. */
+    s_care_food = lv_obj_create(face);
+    lv_obj_remove_style_all(s_care_food);
+    lv_obj_remove_flag(s_care_food, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_care_food, 54, 18);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *dot = care_disc(s_care_food, 0xd98a4a);
+        lv_obj_set_size(dot, 12, 12);
+        lv_obj_set_pos(dot, i * 20 + (i == 1 ? 2 : 0), i == 1 ? 4 : 0);
+    }
+    lv_obj_add_flag(s_care_food, LV_OBJ_FLAG_HIDDEN);
+
+    /* Evolution accessories, drawn over the sprite — the sheet itself is
+     * never touched: a gold bell at the neck from stage 2, a pink ribbon
+     * at the right ear at stage 3. update_care() places them. */
+    s_acc_bell = care_disc(face, 0xf5c542);
+    lv_obj_t *dot = care_disc(s_acc_bell, 0x8a6d1f);
+    lv_obj_set_size(dot, 5, 5);
+    lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_add_flag(s_acc_bell, LV_OBJ_FLAG_HIDDEN);
+    s_acc_ribbon_l = lv_obj_create(face);
+    lv_obj_remove_style_all(s_acc_ribbon_l);
+    lv_obj_remove_flag(s_acc_ribbon_l, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(s_acc_ribbon_l, lv_color_hex(0xff6b9d), 0);
+    lv_obj_set_style_bg_opa(s_acc_ribbon_l, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_acc_ribbon_l, 4, 0);
+    lv_obj_set_style_transform_rotation(s_acc_ribbon_l, 450, 0);
+    lv_obj_set_style_transform_pivot_x(s_acc_ribbon_l, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_acc_ribbon_l, lv_pct(50), 0);
+    lv_obj_add_flag(s_acc_ribbon_l, LV_OBJ_FLAG_HIDDEN);
+    s_acc_ribbon_r = lv_obj_create(face);
+    lv_obj_remove_style_all(s_acc_ribbon_r);
+    lv_obj_remove_flag(s_acc_ribbon_r, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(s_acc_ribbon_r, lv_color_hex(0xff6b9d), 0);
+    lv_obj_set_style_bg_opa(s_acc_ribbon_r, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_acc_ribbon_r, 4, 0);
+    lv_obj_set_style_transform_rotation(s_acc_ribbon_r, -450, 0);
+    lv_obj_set_style_transform_pivot_x(s_acc_ribbon_r, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_acc_ribbon_r, lv_pct(50), 0);
+    lv_obj_add_flag(s_acc_ribbon_r, LV_OBJ_FLAG_HIDDEN);
+    s_acc_ribbon_c = care_disc(face, 0xff8fab);
+    lv_obj_add_flag(s_acc_ribbon_c, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_clock(lv_obj_t *face)
+{
+    s_clock_box = lv_obj_create(face);
+    lv_obj_remove_style_all(s_clock_box);
+    lv_obj_remove_flag(s_clock_box, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_clock_box, 380, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_clock_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_clock_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_clock_box, 12, 0);
+    lv_obj_align(s_clock_box, LV_ALIGN_CENTER, 0, -6);
+    s_clock_time = make_label(s_clock_box, FONT_CLOCK, 0xffffff);
+    lv_label_set_text(s_clock_time, "--:--");
+    s_clock_date = make_label(s_clock_box, caption_font(), COLOR_LIT);
+    s_clock_batt = make_label(s_clock_box, caption_font(), COLOR_DIM);
+    lv_obj_add_flag(s_clock_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Apply yellow-button presses and keep the clock face honest. The clock
+ * yields to everything the avatar face yields to: a turn in progress, a
+ * reply on screen, the care panel. */
+static void update_face_mode(void)
+{
+    if (!s_clock_box) {
+        return;
+    }
+    care_load();
+    while (s_face_toggles_done != s_face_toggles) {
+        s_face_toggles_done++;
+        s_clock_mode = !s_clock_mode;
+        care_save();   /* the mode survives a reboot */
+    }
+    bool caption_up = !lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
+                      || (s_reply_lbl && !lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN))
+                      || s_full_lbl || s_ask_shown;
+    bool show = s_clock_mode && !s_care_open && !caption_up
+                && muse_state_mode(NULL) == MUSE_MODE_IDLE;
+    if (show != s_clock_shown) {
+        s_clock_shown = show;
+        lv_obj_set_flag(s_clock_box, LV_OBJ_FLAG_HIDDEN, !show);
+        lv_obj_set_flag(s_canvas, LV_OBJ_FLAG_HIDDEN, show);
+        if (show) {
+            lv_obj_move_foreground(s_clock_box);
+        }
+    }
+    if (!show) {
+        return;
+    }
+    char buf[48];
+    struct tm local;
+    bool have_time = msw_time_now && msw_time_now(&local);
+    snprintf(buf, sizeof(buf), have_time ? "%02d:%02d" : "--:--",
+             have_time ? local.tm_hour : 0, have_time ? local.tm_min : 0);
+    if (strcmp(buf, lv_label_get_text(s_clock_time)) != 0) {
+        lv_label_set_text(s_clock_time, buf);
+    }
+    if (have_time) {
+        static const char *const WDAY[7] = { "日", "月", "火", "水", "木", "金", "土" };
+        snprintf(buf, sizeof(buf), "%d月%d日（%s）", local.tm_mon + 1, local.tm_mday,
+                 WDAY[local.tm_wday % 7]);
+    } else {
+        buf[0] = '\0';
+    }
+    if (strcmp(buf, lv_label_get_text(s_clock_date)) != 0) {
+        lv_label_set_text(s_clock_date, buf);
+    }
+    muse_power_t power = muse_state_power();
+    if (power.battery_pct >= 0) {
+        snprintf(buf, sizeof(buf), power.charging ? "充電中 %d%%" : "バッテリー %d%%", power.battery_pct);
+    } else {
+        snprintf(buf, sizeof(buf), "%s", power.usb ? "USB給電中" : "");
+    }
+    if (strcmp(buf, lv_label_get_text(s_clock_batt)) != 0) {
+        lv_label_set_text(s_clock_batt, buf);
+    }
+}
+
+/* Place the evolution accessories over the sprite: the bell at grid
+ * (32, 51) — the neck, just above the sprite's blank bottom rows — and
+ * the ribbon at grid (47, 8), the right ear. Positions are relative to
+ * the face tile, so a tile slide carries them with the avatar for free. */
+static void care_accessories(void)
+{
+    static int last_rx = -1, last_ry, last_w, last_stage;
+    static bool last_show;
+    int stage = care_stage();
+    bool show = s_face_active && !s_clock_shown && !s_care_open;
+    lv_area_t c, f;
+    lv_obj_get_coords(s_canvas, &c);
+    lv_obj_get_coords(s_face, &f);
+    int rx = c.x1 - f.x1, ry = c.y1 - f.y1, w = c.x2 - c.x1 + 1;
+    if (rx == last_rx && ry == last_ry && w == last_w && stage == last_stage && show == last_show) {
+        return;
+    }
+    last_rx = rx;
+    last_ry = ry;
+    last_w = w;
+    last_stage = stage;
+    last_show = show;
+    int bs = w * 9 / 64;
+    lv_obj_set_size(s_acc_bell, bs, bs);
+    lv_obj_set_pos(s_acc_bell, rx + w / 2 - bs / 2, ry + w * 51 / 64 - bs / 2);
+    lv_obj_set_flag(s_acc_bell, LV_OBJ_FLAG_HIDDEN, !show || stage < 1);
+    int rs = w * 11 / 64;
+    int kx = rx + w * 47 / 64, ky = ry + w * 8 / 64;
+    lv_obj_set_size(s_acc_ribbon_l, rs, rs);
+    lv_obj_set_pos(s_acc_ribbon_l, kx - rs, ky - rs / 2);
+    lv_obj_set_size(s_acc_ribbon_r, rs, rs);
+    lv_obj_set_pos(s_acc_ribbon_r, kx + rs / 2, ky - rs / 2);
+    int cs = w * 6 / 64;
+    lv_obj_set_size(s_acc_ribbon_c, cs, cs);
+    lv_obj_set_pos(s_acc_ribbon_c, kx - cs / 2, ky - cs / 2);
+    bool ribbon = show && stage >= 2;
+    lv_obj_set_flag(s_acc_ribbon_l, LV_OBJ_FLAG_HIDDEN, !ribbon);
+    lv_obj_set_flag(s_acc_ribbon_r, LV_OBJ_FLAG_HIDDEN, !ribbon);
+    lv_obj_set_flag(s_acc_ribbon_c, LV_OBJ_FLAG_HIDDEN, !ribbon);
+    if (show) {
+        if (stage >= 1) lv_obj_move_foreground(s_acc_bell);
+        if (ribbon) {
+            lv_obj_move_foreground(s_acc_ribbon_l);
+            lv_obj_move_foreground(s_acc_ribbon_r);
+            lv_obj_move_foreground(s_acc_ribbon_c);
+        }
+    }
+}
+
+static void update_care(float now)
+{
+    if (!s_care_panel) {
+        return;
+    }
+    care_load();
+    /* Settle about once a minute: enough for the pose effects and the
+     * panel, and the settle is exact (whole points only). */
+    static float settled_at = -1000.0f;
+    if (now - settled_at > 60.0f) {
+        settled_at = now;
+        care_settle();
+    }
+    if (s_care_open) {
+        care_refresh();
+    }
+    /* The food falls from above the avatar towards its mouth, then goes. */
+    if (s_care_food_until > 0) {
+        if (now >= s_care_food_until) {
+            s_care_food_until = 0;
+            lv_obj_add_flag(s_care_food, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_area_t c, f;
+            lv_obj_get_coords(s_canvas, &c);
+            lv_obj_get_coords(s_face, &f);
+            float k = (now - s_care_food_from) / 0.9f;
+            if (k > 1) k = 1;
+            int w = c.x2 - c.x1 + 1;
+            lv_obj_set_pos(s_care_food, c.x1 - f.x1 + w / 2 - 27,
+                           c.y1 - f.y1 + w / 5 + (int)(w / 3 * k));
+        }
+    }
+    care_accessories();
+    /* A stage reached while the face is at rest grows the avatar to its
+     * new size at once (the reply paths use face_px() too, so a stage
+     * reached mid-reply lands at the next restore instead). */
+    int stage = care_stage();
+    if (s_acc_stage >= 0 && stage != s_acc_stage && s_answer < 0 && !s_full_lbl
+        && !s_clock_shown && !s_care_open) {
+        move_muse(face_px(), s_big_y);
+    }
+    s_acc_stage = stage;
 }
 
 /*
@@ -2345,6 +2939,10 @@ static void build_screen(void)
 #endif
 
     build_answer(face, ring_in);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    build_care(face);    /* dev.14: the care panel, food and accessories */
+    build_clock(face);   /* dev.14: the yellow button's clock face */
+#endif
 }
 
 
@@ -3048,7 +3646,7 @@ static void update_status(muse_mode_t mode, float now)
                 lv_obj_remove_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_remove_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
                 if (answer < 0) {
-                    move_muse(s_canvas_px, s_big_y);
+                    move_muse(face_px(), s_big_y);
                 }
                 s_full_lbl = NULL;
                 s_full_since = 0;
@@ -3060,7 +3658,7 @@ static void update_status(muse_mode_t mode, float now)
                 lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
                 lv_obj_add_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_add_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
-                move_muse(s_canvas_px * 2 / 5, 168);
+                move_muse(face_px() * 2 / 5, 168);
                 if (lbl == s_caption_lbl) {
                     s_full_since = now;
                 }
@@ -3233,6 +3831,8 @@ static void frame_tick(lv_timer_t *timer)
     update_history();
     update_quick();
     update_dash();
+    update_face_mode();   /* dev.14: yellow-button presses, the clock face */
+    update_care(now);     /* dev.14: care meters, food, accessories, growth */
 #endif
     if (s_tv && lv_obj_get_scroll_x(s_tv) != face_scroll_x()) {
         /* Off screen, or sliding to or from settings: hold still so the
@@ -3255,6 +3855,23 @@ static void frame_tick(lv_timer_t *timer)
         .happy = muse_state_happiness(),
         .working = muse_voice_call_view() == MUSE_VOICE_VIEW_WORKING ? 1.0f : 0,
     };
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* dev.14 care, in the pose's own terms: a content avatar (mood 60+)
+     * breaks into its happy face for a moment every few seconds while
+     * idle; a neglected one (mood under 30) dozes instead — the OFF
+     * pose's closed eyes at part brightness — a few seconds at a time.
+     * Neither while the care panel or the clock owns the face. */
+    if (mode == MUSE_MODE_IDLE && !s_care_open && !s_clock_shown) {
+        if (s_care.mood >= 60) {
+            if (fmodf(now, 7.0f) < 1.4f && pose.happy < 0.7f) {
+                pose.happy = 0.7f;
+            }
+        } else if (s_care.mood < 30 && fmodf(now, 11.0f) < 3.0f) {
+            pose.mode = MUSE_MODE_OFF;
+            pose.mode_t = 0.7f;
+        }
+    }
+#endif
     bool render = !muse_board->epaper || mode != s_last_epaper_pose;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     /* Battery: the avatar doesn't need redrawing 25 times a second —
@@ -3326,6 +3943,12 @@ esp_err_t muse_ui_start(void)
     s_image_mutex = xSemaphoreCreateMutex();
     muse_board->display_lock(-1);
     build_screen();
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    care_load();
+    if (face_px() != s_canvas_px) {
+        set_canvas_px(face_px());   /* dev.14: an evolved avatar starts at its size */
+    }
+#endif
     if (s_settings) {
         muse_settings_ui_build(s_settings);
     } else {

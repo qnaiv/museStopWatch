@@ -38,6 +38,14 @@ bool muse_ui_face_active(void);
 
 /* Slide back to the face (e.g. when a talk starts). */
 void muse_ui_show_face(void);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/* museStopWatch dev.14: the yellow button switches the face between the
+ * avatar and the clock. From any task: the press is counted here and
+ * applied in the LVGL task; returns the mode switched to (true: clock). */
+bool muse_ui_toggle_face_mode(void);
+/* From any task: the face currently shows the clock. */
+bool muse_ui_clock_mode(void);
+#endif
 /* Settings sub-pages turn off the tile swipe so they can use horizontal gestures. */
 void muse_ui_set_swipe_enabled(bool enabled);
 /* Temporarily applies a brightness while a slider is dragged. */

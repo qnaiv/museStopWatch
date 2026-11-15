@@ -741,17 +741,15 @@ static void dedicated_buttons(unsigned ev)
             set_asleep(false, muse_board->speaker_button);   /* wake-only press */
         } else if (muse_state_mode(NULL) != MUSE_MODE_OFF) {
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-            /* museStopWatch: the yellow button cycles three sound modes —
-             * sound, vibrate only, mute — vibrate sitting between the two
-             * the button used to toggle. */
-            static const char *const SOUND_HINTS[] = { "SPEAKER OFF", "VIBRATE ONLY", "SPEAKER ON" };
-            int cur = muse_settings_sound_mode();
-            int next = cur == MUSE_SOUND_ON ? MUSE_SOUND_VIBRATE
-                       : cur == MUSE_SOUND_VIBRATE ? MUSE_SOUND_OFF
-                                                   : MUSE_SOUND_ON;
-            muse_settings_set_sound_mode(next);
+            /* museStopWatch dev.14: the yellow button switches the face
+             * between the avatar and the clock — the sound modes moved
+             * into the quick-settings tile. Switching is all it does, so
+             * a stray press costs nothing. The hint names the face the
+             * press is taking the watch to (English, like the sound
+             * hints it replaces). */
+            bool clock = muse_ui_toggle_face_mode();
             if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
-                muse_state_set_hint(SOUND_HINTS[next]);
+                muse_state_set_hint(clock ? "CLOCK" : "AVATAR");
             }
 #else
             bool on = !muse_settings_speaker_on();
