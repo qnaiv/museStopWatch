@@ -35,7 +35,7 @@
 #if CONFIG_MUSE_VIDEO_WIFI
 #include "muse_video_wifi.h"
 #endif
-#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 #include "muse_review.h"
 #endif
 
@@ -75,7 +75,7 @@ void muse_app_run(const muse_board_t *board)
     ESP_ERROR_CHECK(muse_settings_init());
     muse_settings_set_listener(on_setting);
     muse_state_init();
-#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     ESP_ERROR_CHECK(muse_review_init());
 #endif
     muse_battery_init();

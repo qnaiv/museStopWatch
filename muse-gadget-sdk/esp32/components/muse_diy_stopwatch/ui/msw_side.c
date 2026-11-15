@@ -167,6 +167,38 @@ bool msw_side_select(int i)
     return ok;
 }
 
+/* ---- The history tile's quick chat switch (muse_ui.c) ---- */
+
+/* The chat in use, shown over the history tile's switch buttons. Static
+ * storage: the caller compares against what it last showed. */
+const char *msw_chat_name(void)
+{
+    static char name[MSW_SIDE_NAME_MAX + 1];
+    msw_side_t sc;
+    int cur = msw_side_current();
+    if (cur >= 0 && msw_side_get(cur, &sc)) {
+        strlcpy(name, sc.name, sizeof(name));
+    } else {
+        strlcpy(name, "Main chat", sizeof(name));
+    }
+    return name;
+}
+
+/* Steps through the main chat and the side chats, wrapping at both ends:
+ * the quick way to change who a press talks to, without the trip through
+ * Settings > Muse > Side chat. */
+void msw_chat_cycle(int dir)
+{
+    int n = msw_side_count();
+    if (!n || !dir) {
+        return;
+    }
+    int slots = n + 1;                 /* slot 0 is the main chat */
+    int at = msw_side_current() + 1;   /* the main chat is -1: +1 makes it a slot */
+    at = ((at + dir) % slots + slots) % slots;
+    msw_side_select(at - 1);
+}
+
 static void make_uuid(char out[MSW_SIDE_ID_LEN + 1])
 {
     uint8_t b[16];

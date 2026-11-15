@@ -1229,3 +1229,59 @@
   （force push は規則で使わないので、リポジトリを作り直して push する）。
 - `.gitignore` に `.env`、`*.key`、`*.pem`（SDK のサンプル鍵を除く）、`sdkconfig.signing` を足した。
 - 調べたところ、トークン・パスワード・秘密鍵（SDK 付属のサンプル鍵を除く）は見つからなかった。work/ の MAC アドレスは haiatto 氏の実機のもの（元の公開リポジトリにもある）。
+
+## 2026-11-15: 返信履歴・チャット切替（ブランチ feature/reply-history-and-more、未コミット）
+
+ユーザーの依頼（2026-11-15、設計は事前に提示して承認済み）で、ブランチ `feature/reply-history-and-more` に実装。
+main へは入れていない。ビルド（GitHub Actions）と実機確認はまだ。
+
+### 返信履歴（直近8件）
+
+- `muse_review.c/.h`: 従来の「最新1件だけ」から、直近8件のリングに拡張。各エントリ最大 32KB、
+  PSRAM に遅延確保（最大 8×32KB = 256KB、内部 RAM の増加は 100 バイト未満）。再起動で消える（PSRAM のみ、仕様どおり）。
+  追加 API: `muse_review_open()`（最新で開く）、`muse_review_entry_step(dir)`（返信間の移動、+1 が古い方）、
+  `muse_review_info(at, count)`（「何件目／全何件」）。Watcher の既存動作（ホイールで最新返信をページ送り）は不変。
+- Watcher 専用だった review の配線を Museストップウォッチにも通した: CMakeLists（StopWatch の srcs に muse_review.c）、
+  muse_app.c（init）、muse_chat_session.cpp（TEXT_MAX 32KB 化・turn/store・typed turn の append）、
+  muse_chat_link.c（turn/store）、muse_chat_text.c（muse_chat_caption_page）、muse_input.c（スリープで close、コンソール
+  `review.next/prev/close` に `review.older/newer` を追加）。副作用: session の texts バッファが 8 件×1KB → 8 件×32KB
+  （PSRAM、Watcher と同じ）になる。
+- `muse_ui.c`: 文字盤の上に履歴タイルを追加（下スワイプで開く）。タイル配置は行をずらした
+  （履歴=行0、ランチャー/文字盤/設定=行1、アバター=行2）。タイル内: 上部にチャット切替（後述）、
+  「返信履歴」の題、返信本文（タップでページ送り）、「N/M件目・P/Qページ」表示、下部に「まえの返信」「つぎの返信」ボタン。
+  タイル表示中はキャプションページャの寸法をタイル用（幅 320px）に差し替え、文字盤に戻ると復元する（s_page_restore）。
+- `muse_voice.c`: ターン終了時に字幕を消すのをやめた（StopWatch のみ。他ボードは従来どおり）。
+  返信は画面に残り続け、字幕/返信ラベルをタップすると消える（muse_ui.c の on_caption_clicked、アイドル時のみ）。
+
+### チャット切替の近道（追加依頼）
+
+- 履歴タイル上部に現在のチャット名と左右ボタンを置き、メイン⇔サイドを循環切替できるようにした
+  （設定 > Muse > Side chat まで行かなくてよい）。実体は `msw_side.c` の `msw_chat_name()` / `msw_chat_cycle(dir)`
+  （muse_ui.c からは weak フック）。設定側の Side chat ページは current を毎回読むので表示は一致する。
+
+### 検証
+
+- ホストテスト `tests/test_muse_watcher_controls.py`（review の store/step/page と UI のソース検査を含む）: 13 件 OK。
+- `tests/test_muse_chat_session.py` は managed_components（cJSON）未取得のためこのクローンでは実行不可（変更前から同じ）。
+- 実機ビルドは GitHub Actions（Firmware workflow）でのみ可能。**ビルド成功も実機確認もまだ**。
+  次の手順: ユーザーが Actions を実行 → 版上げ＋タグ → Release → 「ファームを更新して」の指示で OTA。
+  OTA の前提として、Secret `MSW_SIGNING_KEY` と実機ファームの署名鍵の同一性は未確認のまま。
+
+### 画面の自動回転（追加依頼）: 調査のみ、未実装
+
+- BMI270 は載っているが、ファームは起動時にセンサーを止めており、起こすのはミニアプリ使用時だけ
+  （board_m5stack_stopwatch.c）。常時姿勢監視は電池を食うので、返信履歴で追った「電池は画面の点灯時間が主因」とも競合する。
+- 表示回転は esp_lv_adapter の初期化時に固定（ROTATE_0）。実行時回転の可否は managed_components 未取得で未確認。
+  ミニアプリ画面が回転に追随するかも未確認。
+- やるなら別ブランチで「起床時に一度だけ姿勢を読んで回転を決める＋設定で通常/反転/自動」の形が現実的。要・実機確認。
+
+### 読み上げの聞き取りにくさ（追加依頼）: 調査のみ
+
+- sanoTTS-jp に速度・ピッチの調整項目は無い（設定 UI にも、msw_tts.c にも、upstream の API にも無い）。声はモデル固定。
+- できるのは読み上げ文を短く・やさしくすること（運用側）。根本対処は別モデル/別方式で、今回の範囲外。
+
+### 電池（調査結果、今回の変更なし）
+
+- 待機側は最適化済み（Wi-Fi モデムスリープ、PM＋tickless、コーデック停止）。主因は画面点灯時間
+  （25fps 再描画＋AMOLED、オートスリープ初期値 120 秒）。まず設定 > Sleep を短くして様子を見るのが先。
+  詳細は ~/workspace/muse-stopwatch/FIRMWARE_IMPROVEMENT_NOTES.md（リポジトリ外の作業メモ）。

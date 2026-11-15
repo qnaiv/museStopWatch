@@ -134,7 +134,7 @@ if(CONFIG_MUSE_ENABLED)
     elseif(CONFIG_MUSE_BOARD_M5STACK_STICKC_PLUS2)
         list(APPEND srcs "boards/board_m5stack_stickc_plus2.c")
     elseif(CONFIG_MUSE_BOARD_M5STACK_STOPWATCH)
-        list(APPEND srcs "boards/board_m5stack_stopwatch.c" "boards/muse_lcd_bands.c" "boards/msw_bmi270_config.c")   # museStopWatch: IMU for mini apps
+        list(APPEND srcs "boards/board_m5stack_stopwatch.c" "boards/muse_lcd_bands.c" "boards/msw_bmi270_config.c" "muse_review.c")   # museStopWatch: IMU for mini apps; review for the reply history
     elseif(CONFIG_MUSE_BOARD_SEEED_XIAO_S3_147)
         list(APPEND srcs "boards/board_seeed_xiao_s3_147.c")
     elseif(CONFIG_MUSE_BOARD_M5STACK_CORES3)

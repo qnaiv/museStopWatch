@@ -50,7 +50,7 @@
 #if CONFIG_MUSE_VIDEO
 #include "muse_video.h"
 #endif
-#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 #include "muse_review.h"
 #endif
 #if CONFIG_MUSE_WATCHER_CAMERA
@@ -145,6 +145,20 @@ void msw_launcher_build(lv_obj_t *tile) __attribute__((weak));
 /* museStopWatch: the avatar picker, below the face (idea 009). */
 static lv_obj_t *s_avatars;
 void msw_avatar_build(lv_obj_t *tile) __attribute__((weak));
+/* museStopWatch: the reply history, above the face (swipe down for it). */
+static lv_obj_t *s_history;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+static lv_obj_t *s_hist_body, *s_hist_pos, *s_hist_chat;
+static muse_review_view_t s_hist_view;
+static char s_hist_buf[MUSE_CAPTION_MAX];
+static int s_hist_cols, s_hist_lines, s_hist_cjk_cols, s_hist_cjk_lines;
+#if CONFIG_MUSE_LATIN_FONT
+static int s_hist_latin_cols, s_hist_latin_lines;
+#endif
+/* museStopWatch: quick chat switching from the history tile (ui/msw_side.c). */
+const char *msw_chat_name(void) __attribute__((weak));
+void msw_chat_cycle(int dir) __attribute__((weak));
+#endif
 #define TILES 3
 static lv_obj_t *s_dots[TILES];
 
@@ -256,6 +270,7 @@ enum { ANSWER_HEARD, ANSWER_READ };
 static answer_layout_t s_answers[2];
 static int s_answer = -1;       /* the layout showing, or -1 */
 static int s_page_for = -1;     /* the layout the reply's page is sized for */
+static bool s_page_restore;     /* the history tile had the pager: size it for the face again */
 static int s_big_y;             /* Muse's centre at full size */
 static int s_muse_y;            /* and now */
 static bool s_muse_up;          /* long layout: up out of the reply's way */
@@ -570,6 +585,17 @@ static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
     muse_state_make_happy();
+}
+
+/* A reply stays up after its turn ends (muse_voice keeps it there now);
+ * tapping the text puts it away. Only while idle: a tap during a turn is
+ * the turn's own business. */
+static void on_caption_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+        muse_state_set_caption("");
+    }
 }
 
 static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compact)
@@ -969,6 +995,8 @@ static void build_answer(lv_obj_t *face, int ring_in)
     lv_label_set_long_mode(s_reply_lbl, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_remove_flag(s_reply_lbl, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_reply_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_reply_lbl, on_caption_clicked, LV_EVENT_CLICKED, NULL);
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
     s_review_position = make_label(face, &lv_font_unscii_8, COLOR_DIM);
     lv_obj_align(s_review_position, LV_ALIGN_BOTTOM_MID, 0, -30);
@@ -1153,6 +1181,187 @@ static void apply_text_size(void)
 }
 #endif
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+static void on_hist_page(lv_event_t *e)
+{
+    (void)e;
+    muse_review_step(1);   /* a tap on the text turns its page */
+}
+
+static void on_hist_older(lv_event_t *e)
+{
+    (void)e;
+    muse_review_entry_step(1);
+}
+
+static void on_hist_newer(lv_event_t *e)
+{
+    (void)e;
+    muse_review_entry_step(-1);
+}
+
+static void on_hist_chat_prev(lv_event_t *e)
+{
+    (void)e;
+    if (msw_chat_cycle) msw_chat_cycle(-1);
+}
+
+static void on_hist_chat_next(lv_event_t *e)
+{
+    (void)e;
+    if (msw_chat_cycle) msw_chat_cycle(1);
+}
+
+static lv_obj_t *hist_button(lv_obj_t *parent, const lv_font_t *font, const char *text, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x241d40), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_t *l = make_label(b, font, COLOR_LIT);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    return b;
+}
+
+/*
+ * The reply history tile (above the face): the chat switcher at the top —
+ * the way out of the Settings > Muse > Side chat trip — then the selected
+ * reply of the last few, paged like the face's read layout but wider, with
+ * buttons to the older and newer replies. update_history() keeps it filled.
+ */
+static void build_history(lv_obj_t *tile)
+{
+    const lv_font_t *font = caption_font();
+    int cw = lv_font_get_glyph_width(font, 'M', ' ');
+    int pitch = lv_font_get_line_height(font) + CAPTION_LINE_SPACE;
+    int cols = cw > 0 ? 320 / cw : 24;
+    int lines = 11;
+    /* A page must fit the review's page buffer, as the face's layouts cap theirs. */
+    while (lines > 1 && (cols + 1) * lines > MUSE_CAPTION_MAX * 2 / 3) lines--;
+    s_hist_cols = cols;
+    s_hist_lines = lines;
+    /* CJK takes the caption font's wider fallback cell. */
+    int cjk_cw = lv_font_get_glyph_width(font, 0x3042, 0);
+    int cjk_cols = cjk_cw > 0 ? 320 / cjk_cw : cols;
+    int cjk_lines = lines;
+    while (cjk_lines > 1 && (3 * cjk_cols + 1) * cjk_lines > MUSE_CAPTION_MAX - 1) cjk_lines--;
+    s_hist_cjk_cols = cjk_cols;
+    s_hist_cjk_lines = cjk_lines;
+#if CONFIG_MUSE_LATIN_FONT
+    int latin_cw = lv_font_get_glyph_width(&muse_font_latin_16, 'M', ' ');
+    int latin_cols = latin_cw > 0 ? 320 / latin_cw : cols;
+    int latin_lines = lines;
+    while (latin_lines > 1 && (3 * latin_cols + 1) * latin_lines > MUSE_CAPTION_MAX - 1) latin_lines--;
+    s_hist_latin_cols = latin_cols;
+    s_hist_latin_lines = latin_lines;
+#endif
+    int body_h = lines * pitch - CAPTION_LINE_SPACE;
+
+    /* The chat in use, with a button each way: tap to talk somewhere else. */
+    lv_obj_t *prev = hist_button(tile, &lv_font_montserrat_20, LV_SYMBOL_LEFT, on_hist_chat_prev);
+    lv_obj_set_size(prev, 48, 48);
+    lv_obj_set_style_radius(prev, LV_RADIUS_CIRCLE, 0);
+    lv_obj_align(prev, LV_ALIGN_TOP_MID, -118, 40);
+    lv_obj_t *next = hist_button(tile, &lv_font_montserrat_20, LV_SYMBOL_RIGHT, on_hist_chat_next);
+    lv_obj_set_size(next, 48, 48);
+    lv_obj_set_style_radius(next, LV_RADIUS_CIRCLE, 0);
+    lv_obj_align(next, LV_ALIGN_TOP_MID, 118, 40);
+    s_hist_chat = make_label(tile, font, COLOR_LIT);
+    lv_obj_set_size(s_hist_chat, 180, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(s_hist_chat, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_align(s_hist_chat, LV_ALIGN_TOP_MID, 0, 54);
+    lv_label_set_text(s_hist_chat, msw_chat_name ? msw_chat_name() : "Main chat");
+
+    lv_obj_t *title = make_label(tile, font, COLOR_DIM);
+    lv_label_set_text(title, "返信履歴");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 106);
+
+    s_hist_body = make_label(tile, font, COLOR_CAPTION);
+    lv_obj_set_size(s_hist_body, 320, body_h);
+    lv_obj_set_style_text_align(s_hist_body, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(s_hist_body, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_remove_flag(s_hist_body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_hist_body, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_hist_body, on_hist_page, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(s_hist_body, LV_ALIGN_TOP_MID, 0, 146);
+
+    s_hist_pos = make_label(tile, font, COLOR_DIM);
+    lv_obj_align(s_hist_pos, LV_ALIGN_TOP_MID, 0, 146 + body_h + 12);
+
+    lv_obj_t *older = hist_button(tile, font, "まえの返信", on_hist_older);
+    lv_obj_set_size(older, 124, 48);
+    lv_obj_align(older, LV_ALIGN_BOTTOM_MID, -72, -30);
+    lv_obj_t *newer = hist_button(tile, font, "つぎの返信", on_hist_newer);
+    lv_obj_set_size(newer, 124, 48);
+    lv_obj_align(newer, LV_ALIGN_BOTTOM_MID, 72, -30);
+}
+
+/* While the history tile is up: it owns the caption pager (the face sizes it
+ * again on the way back, via s_page_restore) and the review selection. */
+static void update_history(void)
+{
+    if (!s_history) return;
+    bool on = s_tv && lv_tileview_get_tile_active(s_tv) == s_history;
+    static bool was_on;
+    if (on && !was_on) {
+        muse_review_open();
+        muse_state_set_page(s_hist_cols, s_hist_lines);
+#if CONFIG_MUSE_CJK_FONT
+        muse_state_set_cjk_page(s_hist_cjk_cols, s_hist_cjk_lines);
+#endif
+#if CONFIG_MUSE_LATIN_FONT
+        muse_state_set_latin_page(s_hist_latin_cols, s_hist_latin_lines);
+#endif
+        s_hist_view.stale = true;
+    } else if (!on && was_on) {
+        muse_review_close();
+#if CONFIG_MUSE_CJK_FONT
+        muse_state_set_cjk_page(0, 0);   /* 0: the face's pages fall back as before */
+#endif
+#if CONFIG_MUSE_LATIN_FONT
+        muse_state_set_latin_page(0, 0);
+#endif
+        s_page_restore = true;
+    }
+    was_on = on;
+    if (!on) return;
+
+    if (msw_chat_name) {
+        const char *name = msw_chat_name();
+        if (name && strcmp(name, lv_label_get_text(s_hist_chat)) != 0) {
+            lv_label_set_text(s_hist_chat, name);
+        }
+    }
+    int at = 0, count = 0;
+    muse_review_info(&at, &count);
+    bool changed;
+    bool active = muse_review_frame(&s_hist_view, s_hist_buf, sizeof(s_hist_buf), &changed);
+    if (!active) {
+        if (count) {
+            /* A new reply landed while reading: it closed the review (as on
+             * the Watcher); open it again at the new reply. */
+            muse_review_open();
+            s_hist_view.stale = true;
+        } else if (strcmp(lv_label_get_text(s_hist_body), "まだ返信がありません") != 0) {
+            lv_label_set_text(s_hist_body, "まだ返信がありません");
+            lv_label_set_text(s_hist_pos, "");
+        }
+        return;
+    }
+    if (changed) {
+        lv_label_set_text(s_hist_body, s_hist_buf);
+    }
+    char pos[48];
+    snprintf(pos, sizeof(pos), "%d/%d件目・%d/%dページ", at, count, s_hist_view.page, s_hist_view.pages);
+    if (strcmp(pos, lv_label_get_text(s_hist_pos)) != 0) {
+        lv_label_set_text(s_hist_pos, pos);
+    }
+}
+#endif
+
 static void build_screen(void)
 {
 #if CONFIG_MUSE_LATIN_FONT
@@ -1171,17 +1380,28 @@ static void build_screen(void)
         lv_obj_set_style_bg_opa(s_tv, LV_OPA_COVER, 0);
         lv_obj_set_scrollbar_mode(s_tv, LV_SCROLLBAR_MODE_OFF);
         int col = 0;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        /* museStopWatch: the reply history sits above the face (swipe down
+         * for it), so the face's row is 1 and the avatar picker moves to 2. */
+        const int row = 1;
+#else
+        const int row = 0;
+#endif
         if (msw_launcher_build) {   /* museStopWatch: swipe right from Muse for the launcher */
             /* LV_DIR_HOR, not only RIGHT: a swipe past the end (to the right
              * here) then bounces (elastic) instead of finding no scroll and
              * becoming a tap or long press on what is under the finger. */
-            s_launcher = lv_tileview_add_tile(s_tv, col++, 0, LV_DIR_HOR);
+            s_launcher = lv_tileview_add_tile(s_tv, col++, row, LV_DIR_HOR);
             lv_obj_set_scrollbar_mode(s_launcher, LV_SCROLLBAR_MODE_OFF);
             msw_launcher_build(s_launcher);
         }
         int face_col = col;
-        s_face = lv_tileview_add_tile(s_tv, col++, 0, (s_launcher ? LV_DIR_LEFT | LV_DIR_RIGHT : LV_DIR_RIGHT)
-                                                       | (msw_avatar_build ? LV_DIR_BOTTOM : 0));
+        s_face = lv_tileview_add_tile(s_tv, col++, row, (s_launcher ? LV_DIR_LEFT | LV_DIR_RIGHT : LV_DIR_RIGHT)
+                                                       | (msw_avatar_build ? LV_DIR_BOTTOM : 0)
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+                                                       | LV_DIR_TOP   /* down to the history */
+#endif
+                                                       );
         /* It never scrolls, but LVGL would size its scrollbars from all its
          * children every time it draws any part of it. */
         lv_obj_set_scrollbar_mode(s_face, LV_SCROLLBAR_MODE_OFF);
@@ -1190,9 +1410,18 @@ static void build_screen(void)
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
         /* museStopWatch: LV_DIR_HOR as the launcher, so a swipe past the end is no tap. */
-        s_settings = lv_tileview_add_tile(s_tv, col, 0, s_launcher ? LV_DIR_HOR : LV_DIR_LEFT);
+        s_settings = lv_tileview_add_tile(s_tv, col, row, s_launcher ? LV_DIR_HOR : LV_DIR_LEFT);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        s_history = lv_tileview_add_tile(s_tv, face_col, 0, LV_DIR_BOTTOM);
+        lv_obj_set_scrollbar_mode(s_history, LV_SCROLLBAR_MODE_OFF);
+        /* Match the face: the tile's theme background otherwise shows as a
+         * different-coloured square. */
+        lv_obj_set_style_bg_color(s_history, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_history, LV_OPA_COVER, 0);
+        build_history(s_history);
+#endif
         if (msw_avatar_build) {   /* museStopWatch: swipe up from Muse for the avatar picker */
-            s_avatars = lv_tileview_add_tile(s_tv, face_col, 1, LV_DIR_TOP);
+            s_avatars = lv_tileview_add_tile(s_tv, face_col, row + 1, LV_DIR_TOP);
             lv_obj_set_scrollbar_mode(s_avatars, LV_SCROLLBAR_MODE_OFF);
             msw_avatar_build(s_avatars);
         }
@@ -1312,6 +1541,8 @@ static void build_screen(void)
     lv_obj_add_flag(s_cv_lbl, LV_OBJ_FLAG_HIDDEN);
 
     s_caption_lbl = make_label(face, font_pick(caption_font(), &lv_font_unscii_8), COLOR_CAPTION);
+    lv_obj_add_flag(s_caption_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_caption_lbl, on_caption_clicked, LV_EVENT_CLICKED, NULL);
     if (s_small) {
         /* Two lines over the bottom of the face, on a dark band so they stay
          * legible. A tall screen has room to keep them above the mic icon. */
@@ -1521,7 +1752,7 @@ static void update_control_hints(muse_mode_t mode)
     /* Don't obscure settings rows/keyboards with floating physical icons.
      * museStopWatch: nor the app launcher (msw_launcher_build). */
     lv_obj_t *tile = s_tv ? lv_tileview_get_tile_active(s_tv) : NULL;
-    bool settings = tile && (tile == s_settings || tile == s_launcher || tile == s_avatars);
+    bool settings = tile && (tile == s_settings || tile == s_launcher || tile == s_avatars || tile == s_history);
     lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, settings);
@@ -2040,9 +2271,10 @@ static void update_status(muse_mode_t mode, float now)
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
         if (reviewing) layout = ANSWER_READ;
 #endif
-        if (layout != s_page_for) {
+        if (layout != s_page_for || s_page_restore) {
             muse_state_set_page(s_answers[layout].cols, s_answers[layout].lines);
             s_page_for = layout;
+            s_page_restore = false;
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
             view.stale = true;   /* a page wrapped for the old layout is wrapped again */
 #endif
@@ -2239,6 +2471,9 @@ static void frame_tick(lv_timer_t *timer)
         s_last_epaper_pose = mode;
     }
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    update_history();
+#endif
     update_status(mode, now);
 }
 

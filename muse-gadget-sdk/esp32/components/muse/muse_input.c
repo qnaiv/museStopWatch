@@ -53,8 +53,10 @@
 #if CONFIG_MUSE_VIDEO
 #include "muse_video.h"
 #endif
-#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 #include "muse_review.h"
+#endif
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
 #include "muse_wheel.h"
 #endif
 #if CONFIG_MUSE_WATCHER_CAMERA
@@ -197,7 +199,7 @@ static void set_asleep(bool asleep, const char *why)
     if (asleep != muse_state_asleep()) {
         ESP_LOGI(TAG, "%s (%s)", asleep ? "sleeping" : "waking", why);
         muse_state_set_asleep(asleep);
-#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
         if (asleep) {
             muse_review_close();   /* auto-sleep too: waking shows the live caption */
         }
@@ -905,7 +907,7 @@ static bool console_command(char *line, bool whole)
         extern bool msw_console(const char *line);
         return msw_console(line);
     }
-#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     if (!strcmp(line, "review.next") || !strcmp(line, "review.prev")) {
         set_asleep(false, "reply review");
         muse_state_poke();
@@ -919,6 +921,16 @@ static bool console_command(char *line, bool whole)
     }
     if (!strcmp(line, "review.close")) {
         muse_review_close();
+        return true;
+    }
+    if (!strcmp(line, "review.older") || !strcmp(line, "review.newer")) {
+        set_asleep(false, "reply review");
+        muse_state_poke();
+        muse_review_entry_step(!strcmp(line, "review.older") ? 1 : -1);
+        int at = 0, count = 0;
+        muse_review_info(&at, &count);
+        printf("@review {\"entry\":%d,\"entries\":%d}\n", at, count);
+        fflush(stdout);
         return true;
     }
 #endif

@@ -588,6 +588,20 @@ static void go_idle(const char *caption)
     muse_state_set_caption("%s", caption);
 }
 
+/* A reply's turn is over. museStopWatch: the reply stays on screen until
+ * it's tapped away (and the history tile keeps it besides), so the turn
+ * ends without clearing the caption. Other boards clear it as before. */
+static void go_idle_reply_done(void)
+{
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    muse_state_poke();   /* as go_idle: the reading clock starts now */
+    muse_state_set_progress(0);
+    muse_state_set_mode(MUSE_MODE_IDLE);
+#else
+    go_idle("");
+#endif
+}
+
 /* Errors and status stay up; a press too short to count only needs a hint. */
 static void too_short(void)
 {
@@ -1390,7 +1404,7 @@ static void voice_task(void *arg)
                 pre_reset();
                 if (!pending_down && !asleep && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
                     muse_state_make_happy();
-                    go_idle("");
+                    go_idle_reply_done();
                 }
                 continue;
             }
@@ -1441,7 +1455,7 @@ static void voice_task(void *arg)
                 pre_reset();
                 if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
                     muse_state_make_happy();
-                    go_idle("");
+                    go_idle_reply_done();
                 }
                 continue;
             }
@@ -1545,7 +1559,7 @@ static void voice_task(void *arg)
         pre_reset();
         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
             muse_state_make_happy();
-            go_idle("");
+            go_idle_reply_done();
         }
     }
 }

@@ -25,13 +25,22 @@
 extern "C" {
 #endif
 
-/* Watcher reply review: a bounded RAM copy survives the chat turn ending. */
+/* Reply review: bounded RAM copies of the last replies survive the chat
+ * turn ending, so a reply can be read again after it leaves the screen. */
 esp_err_t muse_review_init(void);
 /* A new identity for each chat turn, typed or spoken. Replies stored under
- * one identity are joined; the next identity's first reply replaces them. */
+ * one identity are joined; the next identity's first reply starts a new
+ * entry in the ring of the last replies. */
 uint32_t muse_review_turn(void);
 void muse_review_store(uint32_t turn, const char *text);
 bool muse_review_step(int direction);
+/* Moves the selection between replies: +1 to the older one, -1 to the
+ * newer. Opens the review at the newest reply when it isn't open. */
+bool muse_review_entry_step(int direction);
+/* Opens the review at the newest reply (the touch history tile). */
+void muse_review_open(void);
+/* The selected reply's position (1 = newest) and how many replies are kept. */
+bool muse_review_info(int *at, int *count);
 void muse_review_close(void);
 bool muse_review_active(void);
 /* Copies the selected page and returns its one-based position and total. */
