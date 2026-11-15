@@ -1303,3 +1303,7 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
   `|| CONFIG_MUSE_BOARD_M5STACK_STOPWATCH` を追加して main へ push 済み（run #6 で再試行）。
   あわせてヘッダ内の残ガードを点検: muse_board.h の REVIEW_PREV/NEXT は Watcher の
   ロータリー専用で StopWatch 側は使わないため対象外。署名鍵チェック・モデル取得は run #5 でも成功。
+- CI run #6（コミット 2c1830f）: **成功**（check / build / release すべて成功、約6分）。
+  v0.3.0-dev.2 のプレリリースが自動公開され、OTA 用 muse-gadget.bin（2.94 MB）を含む。
+  リポジトリ初の Release。あとはユーザーの指示で OTA を試す段階（実機側の署名鍵が
+  CI の鍵と一致するかは OTA で初めて分かる）。
