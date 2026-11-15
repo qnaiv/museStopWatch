@@ -1498,13 +1498,17 @@ static void update_quick(void)
  * task, so it only copies frames into a buffer and hands over; the task
  * below does the waiting, the envelope parsing and the caching. The last
  * good edition is cached in PSRAM and shown as-is when a fetch fails.
- * Display only: nothing on the tile sends anything back.
+ * Display only: nothing on the tile sends anything back. dev.8: the whole
+ * fetch runs against one deadline (DASH_FETCH_DEADLINE_US) and logs its
+ * stages (TAG "muse_ui", "dash: …"), so a stall resolves and says why.
  */
 #define DASH_PATH "watch_edition.json"
 #define DASH_CAP (8 * 1024)        /* the whole edition, at most */
 #define DASH_CHUNK 1024            /* one /fs/read: len <= 1024 (AGENTS.md) */
 #define DASH_ENV_CAP (12 * 1024)   /* one reply envelope: the frame bound */
 #define DASH_STALE_US (10LL * 60 * 1000 * 1000)
+#define DASH_CHUNK_WAIT_MS 8000    /* one chunk's reply, at most */
+#define DASH_FETCH_DEADLINE_US (30LL * 1000 * 1000)   /* the whole fetch */
 
 static lv_obj_t *s_dash_sub, *s_dash_state, *s_dash_box;
 static char *s_dash_json;          /* PSRAM: the cached edition (raw JSON) */
@@ -1541,7 +1545,11 @@ static void dash_on_frame(void *ctx, int status, const uint8_t *data, size_t len
             s_dash_env_over = true;
         }
     }
-    if (end) {
+    /* The stream is done after end OR a negative status (noise_control.h);
+     * image_fetch's vm_on_frame treats it the same way. Signalling only on
+     * end would leave the fetch task waiting out its timeout on a stream
+     * the daemon reset. */
+    if (end || status < 0) {
         xSemaphoreGive(s_dash_done);
     }
 }
@@ -1561,17 +1569,25 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
     int64_t id = muse_link_req_open("POST", "/fs/read", headers, false, dash_on_frame,
                                     (void *)(uintptr_t)s_dash_gen);
     if (!id) {
+        ESP_LOGW(TAG, "dash: /fs/read open refused (session down or busy)");
         return false;
     }
     if (!muse_link_req_send(id, body, strlen(body), true, 2000)) {
+        ESP_LOGW(TAG, "dash: /fs/read send failed at offset %u", (unsigned)offset);
         muse_link_req_cancel(id);
         return false;
     }
-    if (xSemaphoreTake(s_dash_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+    if (xSemaphoreTake(s_dash_done, pdMS_TO_TICKS(DASH_CHUNK_WAIT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "dash: /fs/read no reply in %d ms at offset %u",
+                 DASH_CHUNK_WAIT_MS, (unsigned)offset);
         muse_link_req_cancel(id);
+        s_dash_gen++;   /* a late frame of this request drops, not lands in
+                         * the next chunk's envelope */
         return false;
     }
     if (s_dash_status != 200 || s_dash_env_over) {
+        ESP_LOGW(TAG, "dash: /fs/read status %d%s at offset %u", s_dash_status,
+                 s_dash_env_over ? " (reply too large)" : "", (unsigned)offset);
         return false;
     }
     s_dash_env[s_dash_env_len] = '\0';
@@ -1606,6 +1622,13 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
         }
         cJSON_Delete(root);
     }
+    if (ok) {
+        ESP_LOGI(TAG, "dash: chunk at %u -> %u bytes, eof %d",
+                 (unsigned)offset, (unsigned)*total, *eof ? 1 : 0);
+    } else {
+        ESP_LOGW(TAG, "dash: /fs/read reply at %u is not a usable envelope (%u bytes)",
+                 (unsigned)offset, (unsigned)s_dash_env_len);
+    }
     return ok;
 }
 
@@ -1614,19 +1637,30 @@ static void dash_fetch_task(void *arg)
     (void)arg;
     for (;;) {
         xSemaphoreTake(s_dash_go, portMAX_DELAY);
+        /* One deadline for the whole fetch — the link wait and every chunk
+         * together — so "更新中…" always resolves: a success replaces the
+         * cache, anything else keeps it and frees the tile. */
+        int64_t deadline = esp_timer_get_time() + DASH_FETCH_DEADLINE_US;
         /* On a wake the link may still be coming up: give it a while. */
-        for (int i = 0; i < 48 && !muse_link_req_ready(); i++) {
+        while (!muse_link_req_ready() && esp_timer_get_time() < deadline) {
             vTaskDelay(pdMS_TO_TICKS(250));
         }
         size_t total = 0;
         bool eof = false, ok = muse_link_req_ready();
+        ESP_LOGI(TAG, "dash: fetch start (link %s)", ok ? "ready" : "down");
         for (int i = 0; ok && !eof && i < 16; i++) {
+            if (esp_timer_get_time() >= deadline) {
+                ESP_LOGW(TAG, "dash: fetch over its deadline at %u bytes", (unsigned)total);
+                ok = false;
+                break;
+            }
             size_t before = total;
             ok = dash_read_chunk(total, &total, &eof);
             if (ok && !eof && total == before) {
                 ok = false;   /* no progress and not eof: do not spin */
             }
         }
+        bool cached = false;
         if (ok && eof && total > 0) {
             s_dash_new[total] = '\0';
             /* Only a parseable edition replaces the cache. */
@@ -1636,7 +1670,15 @@ static void dash_fetch_task(void *arg)
                 memcpy(s_dash_json, s_dash_new, total + 1);
                 s_dash_ok_us = esp_timer_get_time();
                 s_dash_dirty = true;
+                cached = true;
+                ESP_LOGI(TAG, "dash: edition fetched, %u bytes", (unsigned)total);
+            } else {
+                ESP_LOGW(TAG, "dash: fetched %u bytes but not JSON; cache kept",
+                         (unsigned)total);
             }
+        }
+        if (!cached) {
+            ESP_LOGW(TAG, "dash: fetch failed; showing the cached edition");
         }
         s_dash_busy = false;
     }
@@ -1847,10 +1889,15 @@ static void build_screen(void)
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
         /* museStopWatch: the dashboard takes the settings tile's old place,
-         * right of the face. LV_DIR_RIGHT only: a left swipe from it must
-         * not slide on into Settings — that is the quick tile's 設定 button's
-         * job now (lv_tileview_set_tile is not bound by the dir mask). */
-        s_dash = lv_tileview_add_tile(s_tv, col++, row, LV_DIR_RIGHT);
+         * right of the face. A tile's dir names where the view may move FROM
+         * that tile (lv_tileview makes the active tile's dir the tileview's
+         * scroll dir): the face is to its LEFT, so LV_DIR_LEFT only — the
+         * view can slide back to the face, and cannot slide on into
+         * Settings. Settings opens only from the quick tile's 設定 button
+         * (lv_tileview_set_tile is not bound by the dir mask). dev.7 had
+         * LV_DIR_RIGHT here, which did the exact opposite: no way back to
+         * the face, and a clear run into Settings. */
+        s_dash = lv_tileview_add_tile(s_tv, col++, row, LV_DIR_LEFT);
         lv_obj_set_scrollbar_mode(s_dash, LV_SCROLLBAR_MODE_OFF);
         lv_obj_set_style_bg_color(s_dash, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_dash, LV_OPA_COVER, 0);
@@ -2984,6 +3031,19 @@ static void frame_tick(lv_timer_t *timer)
     if (s_image_dsc.data) {
         return;   /* the image covers the face */
     }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* The tile updates run before the off-face early return below, not at
+     * the bottom of the tick: the history and quick tiles share the face's
+     * column, so they passed that check all along, but the dashboard sits
+     * in its own column — at the bottom it never saw a tick while it was
+     * on screen, so it could neither fetch on open nor repaint, and its
+     * state line froze on "更新中…" (dev.7 bug). Each update gates on its
+     * own tile being active, as update_chrome() above already runs for
+     * every tile. */
+    update_history();
+    update_quick();
+    update_dash();
+#endif
     if (s_tv && lv_obj_get_scroll_x(s_tv) != face_scroll_x()) {
         /* Off screen, or sliding to or from settings: hold still so the
          * slide gets the whole frame time. */
@@ -3030,11 +3090,6 @@ static void frame_tick(lv_timer_t *timer)
         s_last_epaper_pose = mode;
     }
 
-#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-    update_history();
-    update_quick();
-    update_dash();
-#endif
     update_status(mode, now);
 }
 

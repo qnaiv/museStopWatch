@@ -1437,3 +1437,54 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
   tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
 - 実機未検証: ビルドは CI で確認する。/fs/read の到達性、タイル内スクロールと
   タイルビューのジェスチャ競合、設定ボタンの遷移アニメーションは OTA 後にユーザーが確認する。
+
+## 2026-11-15 — 0.3.0-dev.8
+
+dev.7 の実機報告2件の修正（変更は muse_ui.c のみ + version.txt）。
+
+### バグ1: ダッシュボードが「更新中…」のまま何も出ない
+
+- 根本原因: frame_tick() の「顔の列以外では早期 return」チェック
+  （scroll_x != face_scroll_x）が、tick 末尾の update_history/update_quick/
+  update_dash 呼び出しより前にある。履歴・クイック設定は顔と同じ列なので
+  従来どおり動いていたが、ダッシュボードは別列の初タイルで、表示中は
+  update_dash() が一切走らなかった。結果: 開いたときの取得トリガが発火せず、
+  s_dash_dirty が消費されず再描画されず、状態ラベルは顔表示中に wake 取得で
+  セットされた「更新中…」のまま凍結した（手動「更新」の結果も描画できない）。
+- 修正: 3つの update_* を早期 return の前（update_chrome の直後）へ移動。
+  各 update は自タイルがアクティブなときだけ動くので他タイルへの影響なし。
+- あわせて取得側を堅牢化（daemon が /fs/read に応答しない等、タスク側で
+  詰まる経路が残らないように）:
+  - 取得全体に締切 30 秒（リンク待ち＋全チャンク通算）。チャンク応答待ちは
+    15 秒 → 8 秒に短縮。失敗時は busy が必ず解除され、旧キャッシュ表示のまま
+    タイルは使える（「更新」で再試行可能）。
+  - dash_on_frame の完了シグナルを end || status < 0 に変更
+    （noise_control.h の契約どおり。image_fetch の vm_on_frame と同じ判定）。
+  - チャンクタイムアウト時に世代カウンタを進め、遅れて届いたフレームが
+    次の取得のエンベロープに混ざらないようにした。
+  - 取得の各段階に ESP_LOGI/ESP_LOGW のブレッドクラムを追加
+    （開始、各チャンクの status/bytes/eof、成功、失敗理由）。TAG は muse_ui。
+
+### バグ2: ダッシュボードから右スワイプで顔に戻れない
+
+- 根本原因: LVGL 9.5.0 の lv_tileview の dir 意味論を取り違えていた。
+  lv_tileview.c: アクティブなタイルの dir がそのまま tileview の scroll dir
+  になる（lv_tileview_set_tile 内 lv_obj_set_scroll_dir、および SCROLL_END
+  ハンドラ）。つまり dir は「そのタイルから view が動ける方向＝到達できる
+  隣タイルの方向」。既存タイルが証拠: クイック設定（顔の上）は LV_DIR_BOTTOM
+  のみ、履歴（顔の下）は LV_DIR_TOP のみ。
+  dev.7 はダッシュボードに LV_DIR_RIGHT を付けたため、右（設定）へは動けるが
+  左（顔）へ戻れなくなっていた（意図と正反対）。
+- 修正: ダッシュボードの dir を LV_DIR_LEFT に変更。顔（RIGHT を含む）から
+  左スワイプで入り、右スワイプで顔に戻り、設定へは滑り込まない。
+  設定は従来どおりクイック設定の「設定」ボタンからのみ開く
+  （lv_tileview_set_tile は dir マスクに縛られない）。
+
+### 検証
+
+- ホストテスト: tests.test_muse_watcher_controls 13件、tests.test_muse_turn_sleep 3件、
+  tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
+- 実機未検証: ビルドは CI で確認する。ダッシュボードの表示更新と
+  右スワイプでの復帰は OTA 後にユーザーが確認する。/fs/read 自体が
+  daemon に届いているかは、今回入れたログ（muse_ui の "dash: …"）で
+  次回失敗時に切り分けられる。
