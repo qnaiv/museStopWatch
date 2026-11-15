@@ -1488,3 +1488,39 @@ dev.7 の実機報告2件の修正（変更は muse_ui.c のみ + version.txt）
   右スワイプでの復帰は OTA 後にユーザーが確認する。/fs/read 自体が
   daemon に届いているかは、今回入れたログ（muse_ui の "dash: …"）で
   次回失敗時に切り分けられる。
+
+## 2026-11-15 — 0.3.0-dev.9
+
+dev.8 の実機報告の修正（変更は muse_ui.c のみ + version.txt）。
+
+### ダッシュボードが「まだ届いていません」のまま（取得が一度も成功しない）
+
+- ユーザー報告（dev.8 実機）: ダッシュボードは「まだ届いていません」表示の
+  まま変わらず、版の取得が一度も成功していない。VM 側の版ファイル
+  （~/watch_edition.json）は存在し内容も正しい。リクエスト/レスポンスの
+  エンベロープ形式（{ok, result}、result.text / data_base64 / eof）は
+  muse-gadget-sdk/linux/README.md と照合済みで、コードと一致している。
+- 切り分けで見つけた具体的な相違: dash_read_chunk() が
+  muse_link_req_open() に渡すヘッダが Content-Type だけだった。
+  同じトランスポートで動作している呼び出し側はすべて追加のヘッダを送る:
+  muse_chat_link.c の request() は x-request-id
+  （"muse-%08x-%08x"、esp_random() 生成）、x-app-id "hatch-web"、
+  Content-Type、Accept を送り、参照クライアント
+  （linux/src/musegadget/link_client.py の _http_headers）も常に
+  x-request-id と x-app-id を付ける。daemon 側が x-request-id
+  （および/または x-app-id）を要求してリクエストを受け付けない／
+  ルーティングできない可能性が高い。
+- 修正: dash_read_chunk() のヘッダを muse_chat_link.c と同じ構成にした。
+  チャンクごとに req_id バッファへ "muse-%08x-%08x"（esp_random() ×2）を
+  生成し、{ "x-request-id", req_id, "x-app-id", "hatch-web",
+  "Content-Type", "application/json", "Accept", "application/json" } を送る。
+  あわせて muse_ui.c に <inttypes.h> と "esp_random.h" を追加
+  （従来はどちらも未 include）。
+
+### 検証
+
+- ホストテスト: tests.test_muse_watcher_controls 13件、tests.test_muse_turn_sleep 3件、
+  tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
+- 実機未検証: ビルドは CI で確認する。ダッシュボードに版が表示されるかは
+  OTA 後にユーザーが確認する。まだ失敗する場合は dev.8 で入れた
+  "dash: …" ログで切り分ける。

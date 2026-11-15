@@ -16,6 +16,7 @@
 
 #include "muse_ui.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -1560,7 +1562,14 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
     char body[128];
     snprintf(body, sizeof(body), "{\"path\":\"" DASH_PATH "\",\"offset\":%u,\"len\":%d}",
              (unsigned)offset, DASH_CHUNK);
-    const char *headers[] = { "Content-Type", "application/json", NULL };
+    /* The same headers Muse's own chat requests carry (muse_chat_link.c):
+     * dev.8 sent Content-Type alone and the daemon never answered, so the
+     * tile stayed on 「まだ届いていません」. */
+    char req_id[40];
+    snprintf(req_id, sizeof(req_id), "muse-%08" PRIx32 "-%08" PRIx32, esp_random(), esp_random());
+    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web",
+                              "Content-Type", "application/json",
+                              "Accept", "application/json", NULL };
     s_dash_gen++;
     s_dash_env_len = 0;
     s_dash_env_over = false;
