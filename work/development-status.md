@@ -1285,3 +1285,10 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
 - 待機側は最適化済み（Wi-Fi モデムスリープ、PM＋tickless、コーデック停止）。主因は画面点灯時間
   （25fps 再描画＋AMOLED、オートスリープ初期値 120 秒）。まず設定 > Sleep を短くして様子を見るのが先。
   詳細は ~/workspace/muse-stopwatch/FIRMWARE_IMPROVEMENT_NOTES.md（リポジトリ外の作業メモ）。
+
+### マージ（2026-11-15 追記）
+
+- ユーザー:「もうマージしちゃっていいよ」。同日、main へマージ済み（GitHub 側コミット e3a129e）。
+  ローカルの git には GitHub 認証が無く通常の git push が使えなかったため、GitHub 連携の push_files で
+  同じ内容を main に直接コミットした（ローカルブランチのコミット a7777f2 と内容は同一）。
+  ビルド（GitHub Actions）と実機確認はまだ。
