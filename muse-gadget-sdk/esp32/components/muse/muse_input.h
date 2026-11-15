@@ -64,6 +64,10 @@ void muse_input_power_init(void);
 /* Whether the CPU powers down in light sleep (muse_input_power_init() got its memory). */
 bool muse_input_cpu_pd(void);
 
+/* museStopWatch: true while a sleep periodic-check window holds the Wi-Fi
+ * nap off so the session can reconnect and look for held messages. */
+bool muse_input_nap_check_open(void);
+
 /* PTT events are posted to `queue` (items are muse_input_event_t). */
 esp_err_t muse_input_start(QueueHandle_t queue);
 /* The voice task has entered the call this DOWN's `mark` started, or dropped

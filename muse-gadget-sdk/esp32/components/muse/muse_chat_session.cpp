@@ -249,6 +249,8 @@ struct msg_t {
     uint8_t mark;            /* museStopWatch: MSW_MARK at its start: MARK_WAIT, MARK_NO, MARK_YES */
     uint8_t pre_len;
     char pre[24];            /* museStopWatch: its first characters, until they show the mark or not */
+    bool proactive;          /* museStopWatch: held though nobody asked (msw_own_event): shown, never spoken */
+    bool ask;                /* museStopWatch: ends with the ask marker: the face offers 承認/やめる */
 };
 
 struct resampler_t {
@@ -334,6 +336,7 @@ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
 static void mark(mark_t m);
 static bool open_note(void);
 static void log_marks(void);
+static size_t msw_ask_cut(const char *text, bool *ask);   /* museStopWatch: defined with the mark handling */
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
 static int64_t s_last_seq;
@@ -1150,6 +1153,9 @@ static bool turn_start(uint32_t gen, bool text)
 #endif
     memset(s_marks, 0, sizeof(s_marks));
     s_reply_shown[0] = '\0';
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    muse_state_ask_set(false);   /* a new turn replaces any unanswered question */
+#endif
     s_turn.start_us = now_us();
     resampler_init(&s_turn.up, MIC_RATE, DICT_RATE);
     if (!ensure_connected()) {
@@ -1505,6 +1511,15 @@ static int bind_msg(const char *id, cJSON *payload)
     msg_t &m = s_turn.msgs[s_turn.nmsgs];
     m = msg_t{};
     strlcpy(m.id, id, sizeof(m.id));
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* A held row carries where it came from: one that replies to nothing
+     * is proactive (shown, never spoken), and one may carry the ask
+     * marker its text was cut of when held. */
+    if (s_turn.incoming) {
+        m.proactive = !parent || !parent[0];
+        m.ask = cJSON_IsTrue(cJSON_GetObjectItem(payload, "msw_ask"));
+    }
+#endif
     return s_turn.nmsgs++;
 }
 
@@ -1583,10 +1598,38 @@ static void message_done(int i, const char *final_text)
     }
     m.done = true;
     mark(M_DONE);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* An approval question: a marked reply ending with the ask marker.
+     * Held rows were cut of it when held (m.ask, from bind_msg); a reply
+     * streamed into this turn still carries it, so cut it from the text
+     * kept for captions and speech, and keep that copy for review too. */
+    bool ask_row = m.ask;
+    if (!ask_row && m.mark == MARK_YES && final_text && final_text[0]) {
+        bool a = false;
+        msw_ask_cut(final_text, &a);
+        if (a) {
+            ask_row = m.ask = true;
+            if (s_turn.texts) {
+                char *full = s_turn.texts + i * TEXT_MAX;
+                bool ta = false;
+                size_t tc = msw_ask_cut(full, &ta);
+                if (ta) {
+                    full[tc] = '\0';
+                    m.len = tc;
+                }
+            }
+        }
+    }
+#endif
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     /* Keep complete final text, rather than the 1 KB automatic-caption copy. */
     const char *review = final_text && final_text[0] ? final_text
         : m.len && s_turn.texts ? s_turn.texts + i * TEXT_MAX : nullptr;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    if (ask_row && s_turn.texts && s_turn.texts[i * TEXT_MAX]) {
+        review = s_turn.texts + i * TEXT_MAX;   /* the ask marker is cut from this copy */
+    }
+#endif
     muse_review_store(s_turn.review, review);
 #endif
     if (s_turn.text) {
@@ -1606,6 +1649,11 @@ static void message_done(int i, const char *final_text)
     if (m.len && m.tts == TTS_NONE) {
         m.tts = TTS_QUEUED;
     }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    if (ask_row) {
+        muse_state_ask_set(true);   /* the face offers 承認/やめる with the kept reply */
+    }
+#endif
     ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
 }
 
@@ -1664,6 +1712,35 @@ static const char *msw_after_mark(const char *s, bool *marked)
         p++;
     }
     return p;
+}
+
+/*
+ * museStopWatch: the ask marker Muse ends an approval question with:
+ * "[ask]" as the message's last word (the face then offers 承認/やめる
+ * buttons with the reply). Returns the text's length without the marker
+ * and the spaces around it, or its full length; *ask says which.
+ */
+#define MSW_ASK "[ask]"
+static size_t msw_ask_cut(const char *text, bool *ask)
+{
+    size_t n = strlen(text);
+    size_t end = n;
+    while (end && msw_space(text[end - 1])) {
+        end--;
+    }
+    size_t a = strlen(MSW_ASK);
+    bool has = end >= a && !strncmp(text + end - a, MSW_ASK, a);
+    if (ask) {
+        *ask = has;
+    }
+    if (!has) {
+        return n;
+    }
+    end -= a;
+    while (end && msw_space(text[end - 1])) {
+        end--;
+    }
+    return end;
 }
 
 /*
@@ -1902,7 +1979,11 @@ static void msw_own_event(const char *event, cJSON *payload, cJSON *line)
         if (!s_pending.replies) {
             s_pending.replies = cJSON_CreateArray();
         }
-        size_t n = whole_chars(text, strnlen(text, TEXT_MAX - 1));
+        /* An approval question ends with the ask marker: hold the text
+         * without it, and say so on the row (bind_msg reads it back). */
+        bool ask = false;
+        size_t cut = msw_ask_cut(text, &ask);
+        size_t n = whole_chars(text, cut > TEXT_MAX - 1 ? TEXT_MAX - 1 : cut);
         char *kept = static_cast<char *>(psram_alloc(n + 1));
         cJSON *row = cJSON_CreateObject();
         if (kept) {
@@ -1911,7 +1992,8 @@ static void msw_own_event(const char *event, cJSON *payload, cJSON *line)
         }
         if (kept && row && cJSON_AddStringToObject(row, "message_id", id) &&
             cJSON_AddStringToObject(row, "reply_to_message_id", "") &&
-            cJSON_AddStringToObject(row, "display_text", kept) && cJSON_AddItemToArray(s_pending.replies, row)) {
+            cJSON_AddStringToObject(row, "display_text", kept) &&
+            (!ask || cJSON_AddBoolToObject(row, "msw_ask", true)) && cJSON_AddItemToArray(s_pending.replies, row)) {
             strlcpy(s_own_seen[s_own_next], id, sizeof(s_own_seen[0]));
             s_own_next = (s_own_next + 1) % OWN_SEEN;
             ESP_LOGI(TAG, "holding it for the voice task (%u bytes)", (unsigned)n);
@@ -1957,8 +2039,12 @@ static void pending_event(const char *event, cJSON *payload, cJSON *line)
     if (!s_pending.replies) {
         s_pending.replies = cJSON_CreateArray();
     }
-    /* Only what playing it needs, and no more text than a turn keeps. */
-    size_t n = whole_chars(text, strnlen(text, TEXT_MAX - 1));
+    /* Only what playing it needs, and no more text than a turn keeps. An
+     * approval question ends with the ask marker: hold the text without
+     * it, and say so on the row (bind_msg reads it back). */
+    bool ask = false;
+    size_t cut = msw_ask_cut(text, &ask);
+    size_t n = whole_chars(text, cut > TEXT_MAX - 1 ? TEXT_MAX - 1 : cut);
     char *kept = static_cast<char *>(psram_alloc(n + 1));
     if (kept) {
         memcpy(kept, text, n);
@@ -1967,7 +2053,7 @@ static void pending_event(const char *event, cJSON *payload, cJSON *line)
     cJSON *row = cJSON_CreateObject();
     if (!kept || !row || !cJSON_AddStringToObject(row, "message_id", id) ||
         !cJSON_AddStringToObject(row, "reply_to_message_id", parent) ||
-        !cJSON_AddStringToObject(row, "display_text", kept)) {
+        !cJSON_AddStringToObject(row, "display_text", kept) || (ask && !cJSON_AddBoolToObject(row, "msw_ask", true))) {
         cJSON_Delete(row);
         row = nullptr;
     }
@@ -2085,6 +2171,16 @@ static void incoming_play(uint32_t gen)
     }
     memcpy(s_turn.user_ids, s_pending.ids, sizeof(s_turn.user_ids));
     cJSON_Delete(replies);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* A proactive message is shown, never spoken; a short pulse announces
+     * it in the sound modes with sound or vibration (muse_review_pulse). */
+    for (int i = 0; i < s_turn.nmsgs; i++) {
+        if (s_turn.msgs[i].proactive) {
+            muse_review_pulse();
+            break;
+        }
+    }
+#endif
     if (!s_turn.nmsgs) {
         turn_fail("");   /* forgotten meanwhile: end the voice task's wait quietly */
     }
@@ -2264,8 +2360,11 @@ static void start_tts(void)
 #if MSW_REPLY_VOICE
         /* museStopWatch: speak it with the local voice. A say from Muse
          * (voice.say) during the turn takes the place of the replies: its
-         * audio plays here if it's still to come, and no reply is spoken. */
-        if (const muse_reply_voice_t *v = muse_reply_voice(); v && !s_turn.text) {
+         * audio plays here if it's still to come, and no reply is spoken.
+         * A proactive message (m.proactive) is never spoken — the user's
+         * rule — so it falls through to the silent pacing below and is
+         * only shown, like with the speaker off. */
+        if (const muse_reply_voice_t *v = muse_reply_voice(); v && !s_turn.text && !m.proactive) {
             bool said = v->says() != s_turn.says0;
             const char *text = s_turn.texts ? s_turn.texts + i * TEXT_MAX : m.tail;
             if (said ? v->say_live() : v->start(text)) {

@@ -136,6 +136,14 @@ static const char *const SLEEP_NAMES[] = { "Never", "30 seconds", "1 minute", "2
 #define SLEEP_COUNT (int)(sizeof(SLEEP_CHOICES) / sizeof(SLEEP_CHOICES[0]))
 static lv_obj_t *s_sleep_checks[SLEEP_COUNT], *s_sleep_rows[SLEEP_COUNT];
 static int s_sleep_shown = -1;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/* museStopWatch: the sleep periodic check (Wi-Fi nap checks), one row per
+ * choice: off, or the interval in minutes. */
+static const int SLPCHK_MINUTES[] = { 0, 5, 10, 15 };
+static const char *const SLPCHK_NAMES[] = { "オフ", "5分", "10分", "15分" };
+#define SLPCHK_COUNT (int)(sizeof(SLPCHK_MINUTES) / sizeof(SLPCHK_MINUTES[0]))
+static lv_obj_t *s_slpchk_checks[SLPCHK_COUNT];
+#endif
 
 /* Battery page. */
 static lv_obj_t *s_batt_status, *s_batt_level, *s_batt_drain, *s_batt_full, *s_batt_off, *s_batt_slept, *s_batt_wakes,
@@ -1421,6 +1429,28 @@ static void on_sleep_now(lv_event_t *e)
     muse_state_set_asleep(true);
 }
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+static void tick_slpchk(void)
+{
+    int cur = muse_settings_sleep_check() ? muse_settings_sleep_check_min() : 0;
+    for (int i = 0; i < SLPCHK_COUNT; i++) {
+        set_text(s_slpchk_checks[i], SLPCHK_MINUTES[i] == cur ? LV_SYMBOL_OK : "");
+    }
+}
+
+static void on_slpchk_choice(lv_event_t *e)
+{
+    int min = SLPCHK_MINUTES[(int)(intptr_t)lv_event_get_user_data(e)];
+    if (min) {
+        muse_settings_set_sleep_check(true);
+        muse_settings_set_sleep_check_min(min);
+    } else {
+        muse_settings_set_sleep_check(false);
+    }
+    tick_slpchk();
+}
+#endif
+
 static void build_sleep_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
@@ -1434,6 +1464,15 @@ static void build_sleep_page(lv_obj_t *tile)
     }
     button(list, LV_SYMBOL_EYE_CLOSE "  Sleep now", COLOR_ACCENT, on_sleep_now, NULL);
     note(list, "画面をタップするか、どちらかのボタンを押すと戻ります。");
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    note(list, "スリープ中の定期チェック:");
+    for (int i = 0; i < SLPCHK_COUNT; i++) {
+        row(list, NULL, SLPCHK_NAMES[i], &s_slpchk_checks[i], on_slpchk_choice, (void *)(intptr_t)i);
+        lv_obj_set_style_text_color(s_slpchk_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+    }
+    note(list, "眠っている間も、選んだ間隔ごとに一度つなぎ直して、新しい返信がないか確認します。");
+    tick_slpchk();
+#endif
 }
 
 static const char *sleep_name(int secs)
@@ -1457,6 +1496,9 @@ static void tick_sleep(void)
         }
     }
     s_sleep_shown = cur;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    tick_slpchk();
+#endif
 }
 
 /* ---------- Battery ---------- */

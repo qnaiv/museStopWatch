@@ -84,6 +84,15 @@ void muse_state_set_hint_ms(const char *text, int ms);
 /* Whether the caption is a hint that hasn't expired yet. */
 bool muse_state_hint_pending(void);
 
+/* museStopWatch: an approval question from Muse (a marked reply ending
+ * with the ask marker) is waiting on the face, which offers 承認/やめる
+ * buttons beside the kept reply. Set when such a reply lands; cleared by
+ * the UI once answered, by the session when a new turn starts, and by
+ * itself once MUSE_ASK_TIMEOUT_MS passes unanswered. */
+#define MUSE_ASK_TIMEOUT_MS (10 * 60 * 1000)
+void muse_state_ask_set(bool pending);
+bool muse_state_ask_pending(void);
+
 /* How much reply text the screen shows at once, set by the UI: lines of up to
  * `cols` characters. The replies are wrapped and paged to fit. A screen that
  * draws CJK larger than its other caption text sets a page for replies with CJK

@@ -34,11 +34,11 @@ static void vibrate_off(void *arg)
     if (msw_board_vibrate) msw_board_vibrate(0);
 }
 
-/* Vibrate-only sound mode: a new reply announces itself with one short
- * pulse of the motor instead of the speaker. */
-static void pulse_for_reply(void)
+/* One short pulse of the motor. A second call while it runs just extends
+ * it (the off timer restarts), so overlapping calls stay one pulse. */
+static void pulse_motor(void)
 {
-    if (!msw_board_vibrate || muse_settings_sound_mode() != MUSE_SOUND_VIBRATE) return;
+    if (!msw_board_vibrate) return;
     static esp_timer_handle_t off;
     if (!off) {
         const esp_timer_create_args_t args = { .callback = vibrate_off, .name = "vib_off" };
@@ -48,7 +48,27 @@ static void pulse_for_reply(void)
     msw_board_vibrate(80);
     esp_timer_start_once(off, 150 * 1000);
 }
+
+/* Vibrate-only sound mode: a new reply announces itself with one short
+ * pulse of the motor instead of the speaker. */
+static void pulse_for_reply(void)
+{
+    if (muse_settings_sound_mode() != MUSE_SOUND_VIBRATE) return;
+    pulse_motor();
+}
 #endif
+
+/* A proactive message (nobody asked for it) is never spoken; in the sound
+ * modes with sound or vibration it announces itself with one pulse. */
+void muse_review_pulse(void)
+{
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    int mode = muse_settings_sound_mode();
+    if (mode == MUSE_SOUND_ON || mode == MUSE_SOUND_VIBRATE) {
+        pulse_motor();
+    }
+#endif
+}
 
 #define REVIEW_CAP (32 * 1024)
 /* The last replies, newest first. Each buffer is lazily allocated in PSRAM,

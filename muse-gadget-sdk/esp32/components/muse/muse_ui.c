@@ -212,6 +212,8 @@ static int s_cap_h, s_cap_y;   /* the caption's built height and centre offset, 
 static lv_obj_t *s_full_lbl;   /* the reply label up large, Muse shrunk below it */
 static float s_full_since;     /* when the kept reply went up (auto-clears seconds later) */
 static lv_obj_t *s_quick_bright, *s_quick_bright_val, *s_quick_vol, *s_quick_vol_val;
+static lv_obj_t *s_ask_ok, *s_ask_no;   /* approval buttons over a question's kept reply */
+static bool s_ask_shown;
 #endif
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
@@ -602,6 +604,32 @@ static void on_caption_clicked(lv_event_t *e)
         muse_state_set_caption("%s", "");
     }
 }
+
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/* The approval buttons: the answer goes back as a typed turn, the same
+ * channel the serial console uses (muse_hatch_text_turn takes the string
+ * and frees it). Answering clears the question first, so the buttons go
+ * even if the turn can't start. */
+static void on_ask_ok(lv_event_t *e)
+{
+    (void)e;
+    muse_state_ask_set(false);
+    char *text = strdup("承認します");
+    if (text) {
+        muse_hatch_text_turn(text);
+    }
+}
+
+static void on_ask_no(lv_event_t *e)
+{
+    (void)e;
+    muse_state_ask_set(false);
+    char *text = strdup("やめます");
+    if (text) {
+        muse_hatch_text_turn(text);
+    }
+}
+#endif
 
 static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compact)
 {
@@ -1722,6 +1750,19 @@ static void build_screen(void)
         s_meter[i] = seg;
     }
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* Approval buttons, over the bottom of the face: hidden until a
+     * question from Claude waits with its kept reply (update_status). */
+    s_ask_ok = hist_button(face, caption_font(), "承認", on_ask_ok);
+    lv_obj_set_size(s_ask_ok, 124, 52);
+    lv_obj_align(s_ask_ok, LV_ALIGN_BOTTOM_MID, -72, -24);
+    lv_obj_add_flag(s_ask_ok, LV_OBJ_FLAG_HIDDEN);
+    s_ask_no = hist_button(face, caption_font(), "やめる", on_ask_no);
+    lv_obj_set_size(s_ask_no, 124, 52);
+    lv_obj_align(s_ask_no, LV_ALIGN_BOTTOM_MID, 72, -24);
+    lv_obj_add_flag(s_ask_no, LV_OBJ_FLAG_HIDDEN);
+#endif
+
     build_answer(face, ring_in);
 }
 
@@ -2452,6 +2493,24 @@ static void update_status(muse_mode_t mode, float now)
 #endif
     }
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* While a question waits, its buttons are up over the kept reply and
+     * the reply stays: the auto-clear below must not take the question
+     * away. Once it is answered (or times out), the usual few seconds run
+     * from then. */
+    {
+        bool ask = muse_state_ask_pending() && mode == MUSE_MODE_IDLE;
+        if (ask != s_ask_shown) {
+            s_ask_shown = ask;
+            lv_obj_set_flag(s_ask_ok, LV_OBJ_FLAG_HIDDEN, !ask);
+            lv_obj_set_flag(s_ask_no, LV_OBJ_FLAG_HIDDEN, !ask);
+            if (!ask && s_full_lbl == s_caption_lbl) {
+                s_full_since = now;
+            }
+        }
+        if (muse_state_ask_pending()) {
+            s_full_since = 0;
+        }
+    }
     /* The kept reply has been read by now: clear it and give Muse the
      * face back. It stays in the history tile. */
     if (s_full_lbl == s_caption_lbl && s_full_since > 0 && mode == MUSE_MODE_IDLE

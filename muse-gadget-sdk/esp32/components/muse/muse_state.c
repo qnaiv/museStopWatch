@@ -46,6 +46,7 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_caption[MUSE_CAPTION_MAX];
 static uint32_t s_caption_version;
 static volatile int64_t s_hint_until_us;   /* hint caption expiry; 0 = none pending */
+static volatile int64_t s_ask_until_us;    /* museStopWatch: the ask's expiry; 0 = no question waiting */
 static SemaphoreHandle_t s_format_lock;
 static EventGroupHandle_t s_wake;
 static volatile int s_page_cols = 16, s_page_lines = 2;
@@ -167,6 +168,21 @@ bool muse_state_hint_pending(void)
 {
     portENTER_CRITICAL(&s_lock);
     bool pending = s_hint_until_us && esp_timer_get_time() <= s_hint_until_us;
+    portEXIT_CRITICAL(&s_lock);
+    return pending;
+}
+
+void muse_state_ask_set(bool pending)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_ask_until_us = pending ? esp_timer_get_time() + (int64_t)MUSE_ASK_TIMEOUT_MS * 1000 : 0;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+bool muse_state_ask_pending(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool pending = s_ask_until_us && esp_timer_get_time() <= s_ask_until_us;
     portEXIT_CRITICAL(&s_lock);
     return pending;
 }

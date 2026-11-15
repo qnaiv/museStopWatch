@@ -582,6 +582,64 @@ static bool update_power(void)
     return paused;
 }
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+#define NAP_CHECK_WINDOW_MS 20000   /* reconnect and look for held messages */
+
+static volatile bool s_nap_check_open;
+
+/*
+ * The sleep periodic check (Settings > Sleep; on, every 5 minutes by
+ * default): while Wi-Fi naps, lift the nap for NAP_CHECK_WINDOW_MS every
+ * interval so the link rejoins and the session reconnects. The voice task
+ * is nudged awake and polls for held messages meanwhile; a delivery wakes
+ * the screen, which ends the nap for real (want_nap goes false). Nothing
+ * found: the nap resumes and the next check is one interval later. The
+ * only state is the window and the next due time; update_wifi_nap below
+ * still owns the nap itself. Returns the nap state to apply.
+ */
+static bool nap_check(TickType_t now, bool want_nap)
+{
+    static TickType_t due;     /* the next check may open at or after this; 0 = unscheduled */
+    static TickType_t opened;  /* when the open window began */
+    static bool open;
+    if (!want_nap) {
+        open = false;
+        due = 0;
+        s_nap_check_open = false;
+        return false;
+    }
+    if (open) {
+        if ((int32_t)(now - opened) < (int32_t)pdMS_TO_TICKS(NAP_CHECK_WINDOW_MS)) {
+            return false;   /* the window: Wi-Fi stays up */
+        }
+        open = false;
+        s_nap_check_open = false;
+        due = now + pdMS_TO_TICKS((TickType_t)muse_settings_sleep_check_min() * 60 * 1000);
+    }
+    if (!muse_settings_sleep_check()) {
+        return true;
+    }
+    if (!due) {
+        due = now + pdMS_TO_TICKS((TickType_t)muse_settings_sleep_check_min() * 60 * 1000);
+        return true;
+    }
+    if ((int32_t)(now - due) < 0) {
+        return true;
+    }
+    open = true;
+    opened = now;
+    s_nap_check_open = true;
+    muse_state_nudge();   /* the resting voice task polls for incoming now */
+    ESP_LOGI(TAG, "nap check: Wi-Fi up for %d s", NAP_CHECK_WINDOW_MS / 1000);
+    return false;
+}
+
+bool muse_input_nap_check_open(void)
+{
+    return s_nap_check_open;
+}
+#endif
+
 /*
  * Low power for WIFI_NAP_MS: Wi-Fi off, since keeping it associated costs
  * more than the rest of the chip. It rejoins when the screen wakes or USB
@@ -602,6 +660,9 @@ static bool update_wifi_nap(TickType_t now, bool paused)
     }
     bool nap = paused && !muse_voice_notes_waiting()
                && (s_nap_now || (s_cpu_low && now - low_since >= pdMS_TO_TICKS(WIFI_NAP_MS)));
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    nap = nap_check(now, nap);   /* a periodic-check window holds the nap off */
+#endif
     if (nap != napping) {
         napping = nap;
         ESP_LOGI(TAG, "Wi-Fi %s", nap ? "napping" : "waking");

@@ -65,6 +65,9 @@ static const char *TAG = "muse_voice";
 #define PRE_CAP_CHUNKS (PRE_CHUNKS + NOTE_MIN_HOLD_US / CHUNK_US)
 #define SETTLE_CHUNKS 10   /* after Muse makes a sound, 200 ms of capture is its own tail */
 #define REST_BACKSTOP_MS 60000
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+#define NAP_CHECK_POLL_MS 1000   /* resting in a nap check window: poll for incoming this often */
+#endif
 
 #if CONFIG_MUSE_HATCH
 /* A note recorded while Hatch is out of reach is saved in PSRAM, and goes once it's back. */
@@ -1386,6 +1389,9 @@ static void note_toggled(bool on)
 static void voice_task(void *arg)
 {
     bool pending_down = false;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    bool check_was_open = false;   /* a nap check window was open last rest loop */
+#endif
     muse_audio_selftest();
     for (;;) {
         bool wake = false;
@@ -1417,7 +1423,42 @@ static void voice_task(void *arg)
                 /* Wait for waking, USB power or a bench request without
                  * polling (the timeout is only a backstop, or a look for
                  * Wi-Fi to send saved notes), so the CPU can stay asleep. */
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+                /* In a nap check window the session is reconnecting: poll
+                 * often, a held message may land at any moment. */
+                bool check_open = muse_input_nap_check_open();
+                muse_state_wait_awake(check_open ? NAP_CHECK_POLL_MS
+                                      : s_waiting  ? HELD_POLL_MS
+                                                   : REST_BACKSTOP_MS);
+                /* The window lifts the session's rest too: unconnected and
+                 * resting, its task sleeps until a command, so nothing
+                 * would reconnect it while Wi-Fi is back. Clearing rest
+                 * wakes it (CMD_WAKE) to reconnect at once; when the window
+                 * closes with nothing delivered, rest is restored before
+                 * the nap resumes. Direct calls on purpose: this task's own
+                 * resting flag, which pauses the display, is unchanged. */
+                if (check_open != check_was_open) {
+                    check_was_open = check_open;
+                    muse_hatch_set_resting(!check_open);
+                }
+                /* What was held while resting is delivered now, as on the
+                 * awake path below, not at the next press. Proactive
+                 * messages are shown, not spoken (muse_chat_session). */
+                muse_input_event_t queued;
+                if (xQueuePeek(s_queue, &queued, 0) != pdTRUE && muse_hatch_incoming()) {
+                    bool delivered;
+                    muse_state_set_asleep(false);
+                    muse_wifi_power(MUSE_WIFI_FULL);
+                    pending_down = hatch_reply(&delivered, true);
+                    pre_reset();
+                    if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+                        muse_state_make_happy();
+                        go_idle_reply_done();
+                    }
+                }
+#else
                 muse_state_wait_awake(s_waiting ? HELD_POLL_MS : REST_BACKSTOP_MS);
+#endif
                 continue;
             }
             if (s_chirp) {

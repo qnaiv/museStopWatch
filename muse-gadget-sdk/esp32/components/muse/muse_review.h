@@ -33,6 +33,10 @@ esp_err_t muse_review_init(void);
  * entry in the ring of the last replies. */
 uint32_t muse_review_turn(void);
 void muse_review_store(uint32_t turn, const char *text);
+/* museStopWatch: one short motor pulse for a proactive message arriving
+ * (the chat session calls it): in the sound modes ON and VIBRATE, never
+ * in OFF. A no-op on other boards. */
+void muse_review_pulse(void);
 bool muse_review_step(int direction);
 /* Moves the selection between replies: +1 to the older one, -1 to the
  * newer. Opens the review at the newest reply when it isn't open. */

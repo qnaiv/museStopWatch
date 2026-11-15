@@ -40,6 +40,8 @@ static struct {
     uint8_t mic_gain;
     uint8_t brightness;
     uint16_t sleep_s;
+    bool sleep_check;         /* museStopWatch: periodic check while Wi-Fi naps */
+    uint8_t sleep_check_min;  /* its interval: 5, 10 or 15 */
     uint8_t text_size;
     bool wifi_on;
     bool ble_on;
@@ -55,6 +57,8 @@ static struct {
     .mic_gain = 30,
     .brightness = 100,
     .sleep_s = 120,
+    .sleep_check = true,
+    .sleep_check_min = 5,
     .text_size = MUSE_TEXT_MEDIUM,
     .wifi_on = true,
     .host = DEFAULT_HOST,
@@ -141,6 +145,12 @@ esp_err_t muse_settings_init(void)
 #endif
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
+    if (nvs_get_u8(s_nvs, "slp_chk", &b) == ESP_OK) {
+        s.sleep_check = b;
+    }
+    if (nvs_get_u8(s_nvs, "slp_chk_min", &b) == ESP_OK && (b == 5 || b == 10 || b == 15)) {
+        s.sleep_check_min = b;
+    }
     load_u8("text_size", &s.text_size);
     if (nvs_get_u8(s_nvs, "wifi_on", &b) == ESP_OK) {
         s.wifi_on = b;
@@ -175,6 +185,8 @@ int muse_settings_sound_mode(void) { return s.sound_mode; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
+bool muse_settings_sleep_check(void) { return s.sleep_check; }
+int muse_settings_sleep_check_min(void) { return s.sleep_check_min; }
 int muse_settings_text_size(void) { return s.text_size; }
 bool muse_settings_wifi_on(void) { return s.wifi_on; }
 bool muse_settings_ble_on(void) { return s.ble_on; }
@@ -267,6 +279,20 @@ void muse_settings_set_sleep_s(int secs)
     s.sleep_s = clampi(secs, 0, 3600);
     nvs_set_u16(s_nvs, "sleep_s", s.sleep_s);
     nvs_commit(s_nvs);
+    notify(MUSE_SETTING_SLEEP);
+}
+
+void muse_settings_set_sleep_check(bool on)
+{
+    s.sleep_check = on;
+    save_u8("slp_chk", on);
+    notify(MUSE_SETTING_SLEEP);
+}
+
+void muse_settings_set_sleep_check_min(int min)
+{
+    s.sleep_check_min = min == 10 || min == 15 ? min : 5;
+    save_u8("slp_chk_min", s.sleep_check_min);
     notify(MUSE_SETTING_SLEEP);
 }
 

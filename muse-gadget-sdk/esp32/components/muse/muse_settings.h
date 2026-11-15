@@ -64,6 +64,12 @@ void muse_settings_set_sound_mode(int mode);
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_brightness(void);     /* 10..100 */
 int muse_settings_sleep_s(void);        /* 0 = never */
+/* museStopWatch: while Wi-Fi naps in sleep, lift the nap every few minutes
+ * to check for messages (Settings > Sleep). On by default, every 5 minutes. */
+bool muse_settings_sleep_check(void);
+void muse_settings_set_sleep_check(bool on);
+int muse_settings_sleep_check_min(void);   /* 5, 10 or 15 */
+void muse_settings_set_sleep_check_min(int min);
 /* Reply text size on small screens with full-screen replies. */
 enum { MUSE_TEXT_SMALL, MUSE_TEXT_MEDIUM, MUSE_TEXT_LARGE };
 int muse_settings_text_size(void);
