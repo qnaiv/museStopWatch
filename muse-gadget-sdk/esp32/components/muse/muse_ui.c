@@ -26,6 +26,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "lvgl.h"
 #include "mbedtls/base64.h"
 #include "src/draw/lv_image_decoder_private.h"   /* custom decoder */
@@ -52,6 +53,9 @@
 #endif
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 #include "muse_review.h"
+#endif
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+#include "cJSON.h"   /* museStopWatch: the dashboard edition is JSON */
 #endif
 #if CONFIG_MUSE_WATCHER_CAMERA
 #include "boards/watcher_camera.h"
@@ -146,6 +150,9 @@ void msw_launcher_build(lv_obj_t *tile) __attribute__((weak));
 static lv_obj_t *s_history;
 /* museStopWatch: quick settings, above the face (swipe down for them). */
 static lv_obj_t *s_quick;
+/* museStopWatch: the dashboard, right of the face (swipe left for it);
+ * Settings moved one tile further right and is opened from quick settings. */
+static lv_obj_t *s_dash;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 static lv_obj_t *s_hist_body, *s_hist_pos, *s_hist_chat;
 static muse_review_view_t s_hist_view;
@@ -167,11 +174,16 @@ static int face_scroll_x(void)
     return s_face ? lv_obj_get_x(s_face) : 0;
 }
 
-/* 0 launcher, 1 face, 2 settings (dots left to right). */
+/* 0 launcher, 1 face, 2 right of the face (dots left to right). museStopWatch:
+ * the dashboard sits at 2 now, with Settings one more tile to the right. */
 static int tile_page(void)
 {
     lv_obj_t *t = lv_tileview_get_tile_active(s_tv);
-    return t == s_settings ? 2 : t == s_launcher ? 0 : 1;
+    return t == s_settings ? 2 : t == s_launcher ? 0 :
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+           t == s_dash ? 2 :
+#endif
+           1;
 }
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
@@ -1411,6 +1423,16 @@ static void on_quick_vol(lv_event_t *e)
     muse_settings_set_volume((int)lv_slider_get_value(lv_event_get_target(e)));
 }
 
+/* Settings lives one tile past the dashboard now; this button is its door
+ * (the left swipe from the face lands on the dashboard instead). */
+static void on_quick_settings(lv_event_t *e)
+{
+    (void)e;
+    if (s_tv && s_settings) {
+        lv_tileview_set_tile(s_tv, s_settings, LV_ANIM_ON);
+    }
+}
+
 static lv_obj_t *quick_slider(lv_obj_t *tile, const lv_font_t *font, const char *name, int y,
                               int min, int max, int val, lv_event_cb_t cb, lv_obj_t **val_out)
 {
@@ -1439,6 +1461,9 @@ static void build_quick(lv_obj_t *tile)
                                   on_quick_bright, &s_quick_bright_val);
     s_quick_vol = quick_slider(tile, font, "音量", 216, 0, 100, muse_settings_volume(),
                                on_quick_vol, &s_quick_vol_val);
+    lv_obj_t *settings = hist_button(tile, font, "設定", on_quick_settings);
+    lv_obj_set_size(settings, 160, 52);
+    lv_obj_align(settings, LV_ALIGN_TOP_MID, 0, 318);
     lv_obj_t *hint = make_label(tile, font, COLOR_DIM);
     lv_label_set_text(hint, "上にスワイプでもどる");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -36);
@@ -1464,6 +1489,313 @@ static void update_quick(void)
     snprintf(buf, sizeof(buf), "%d%%", muse_settings_volume());
     if (strcmp(buf, lv_label_get_text(s_quick_vol_val)) != 0) lv_label_set_text(s_quick_vol_val, buf);
 }
+
+/*
+ * The dashboard tile (right of the face): the morning/evening "edition"
+ * Muse writes to watch_edition.json in the VM's home. The tile reads it
+ * with a daemon request (POST /fs/read, in <=1 KB chunks until the reply
+ * says eof) on its own task — the request callback runs on the session
+ * task, so it only copies frames into a buffer and hands over; the task
+ * below does the waiting, the envelope parsing and the caching. The last
+ * good edition is cached in PSRAM and shown as-is when a fetch fails.
+ * Display only: nothing on the tile sends anything back.
+ */
+#define DASH_PATH "watch_edition.json"
+#define DASH_CAP (8 * 1024)        /* the whole edition, at most */
+#define DASH_CHUNK 1024            /* one /fs/read: len <= 1024 (AGENTS.md) */
+#define DASH_ENV_CAP (12 * 1024)   /* one reply envelope: the frame bound */
+#define DASH_STALE_US (10LL * 60 * 1000 * 1000)
+
+static lv_obj_t *s_dash_sub, *s_dash_state, *s_dash_box;
+static char *s_dash_json;          /* PSRAM: the cached edition (raw JSON) */
+static char *s_dash_new;           /* PSRAM: the edition being fetched */
+static char *s_dash_env;           /* PSRAM: one reply envelope, assembled */
+static char *s_dash_scratch;       /* PSRAM: a section's lines, joined */
+static size_t s_dash_env_len;
+static bool s_dash_env_over;
+static int s_dash_status;          /* the reply's HTTP status (first frame) */
+static uint32_t s_dash_gen;        /* request generation: stale frames drop */
+static SemaphoreHandle_t s_dash_go;    /* a fetch was requested */
+static SemaphoreHandle_t s_dash_done;  /* the current request has ended */
+static TaskHandle_t s_dash_task;
+static volatile bool s_dash_busy;
+static volatile bool s_dash_dirty;     /* the cache changed: re-render */
+static volatile bool s_dash_wake;      /* the screen woke: fetch (update_sleep) */
+static int64_t s_dash_ok_us;           /* the last successful fetch */
+
+/* On the session task: copy the frame out and hand over, nothing more. */
+static void dash_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
+{
+    if ((uint32_t)(uintptr_t)ctx != s_dash_gen) {
+        return;   /* a frame of a request already given up on */
+    }
+    if (status != 0) {
+        s_dash_status = status;   /* the first frame carries the HTTP status;
+                                   * a failure ends the request with a negative */
+    }
+    if (data && len) {
+        if (s_dash_env_len + len < DASH_ENV_CAP) {
+            memcpy(s_dash_env + s_dash_env_len, data, len);
+            s_dash_env_len += len;
+        } else {
+            s_dash_env_over = true;
+        }
+    }
+    if (end) {
+        xSemaphoreGive(s_dash_done);
+    }
+}
+
+/* One /fs/read chunk of the edition into s_dash_new at *total. False: stop. */
+static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
+{
+    char body[128];
+    snprintf(body, sizeof(body), "{\"path\":\"" DASH_PATH "\",\"offset\":%u,\"len\":%d}",
+             (unsigned)offset, DASH_CHUNK);
+    const char *headers[] = { "Content-Type", "application/json", NULL };
+    s_dash_gen++;
+    s_dash_env_len = 0;
+    s_dash_env_over = false;
+    s_dash_status = 0;
+    xSemaphoreTake(s_dash_done, 0);   /* drain a stale give */
+    int64_t id = muse_link_req_open("POST", "/fs/read", headers, false, dash_on_frame,
+                                    (void *)(uintptr_t)s_dash_gen);
+    if (!id) {
+        return false;
+    }
+    if (!muse_link_req_send(id, body, strlen(body), true, 2000)) {
+        muse_link_req_cancel(id);
+        return false;
+    }
+    if (xSemaphoreTake(s_dash_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        muse_link_req_cancel(id);
+        return false;
+    }
+    if (s_dash_status != 200 || s_dash_env_over) {
+        return false;
+    }
+    s_dash_env[s_dash_env_len] = '\0';
+    /* The reply is an {ok, result} envelope: result carries the chunk as
+     * UTF-8 text (or data_base64) and eof once the file is done. */
+    bool ok = false;
+    *eof = false;
+    cJSON *root = cJSON_Parse(s_dash_env);
+    if (root) {
+        cJSON *res = cJSON_GetObjectItemCaseSensitive(root, "result");
+        cJSON *okj = cJSON_GetObjectItemCaseSensitive(root, "ok");
+        if (res && (!okj || cJSON_IsTrue(okj))) {
+            *eof = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "eof"));
+            cJSON *text = cJSON_GetObjectItemCaseSensitive(res, "text");
+            cJSON *b64 = cJSON_GetObjectItemCaseSensitive(res, "data_base64");
+            if (cJSON_IsString(text) && text->valuestring) {
+                size_t n = strlen(text->valuestring);
+                if (*total + n <= DASH_CAP) {
+                    memcpy(s_dash_new + *total, text->valuestring, n);
+                    *total += n;
+                    ok = true;
+                }
+            } else if (cJSON_IsString(b64) && b64->valuestring) {
+                size_t out = 0;
+                if (mbedtls_base64_decode((unsigned char *)s_dash_new + *total, DASH_CAP - *total,
+                                          &out, (const unsigned char *)b64->valuestring,
+                                          strlen(b64->valuestring)) == 0) {
+                    *total += out;
+                    ok = true;
+                }
+            }
+        }
+        cJSON_Delete(root);
+    }
+    return ok;
+}
+
+static void dash_fetch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(s_dash_go, portMAX_DELAY);
+        /* On a wake the link may still be coming up: give it a while. */
+        for (int i = 0; i < 48 && !muse_link_req_ready(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        size_t total = 0;
+        bool eof = false, ok = muse_link_req_ready();
+        for (int i = 0; ok && !eof && i < 16; i++) {
+            size_t before = total;
+            ok = dash_read_chunk(total, &total, &eof);
+            if (ok && !eof && total == before) {
+                ok = false;   /* no progress and not eof: do not spin */
+            }
+        }
+        if (ok && eof && total > 0) {
+            s_dash_new[total] = '\0';
+            /* Only a parseable edition replaces the cache. */
+            cJSON *probe = cJSON_Parse(s_dash_new);
+            if (probe) {
+                cJSON_Delete(probe);
+                memcpy(s_dash_json, s_dash_new, total + 1);
+                s_dash_ok_us = esp_timer_get_time();
+                s_dash_dirty = true;
+            }
+        }
+        s_dash_busy = false;
+    }
+}
+
+static void dash_request(void)
+{
+    if (!s_dash_task || s_dash_busy) {
+        return;
+    }
+    s_dash_busy = true;
+    xSemaphoreGive(s_dash_go);
+}
+
+/* From update_sleep(), on the wake edge. Consumed by update_dash(). */
+static void dash_note_wake(void)
+{
+    s_dash_wake = true;
+}
+
+static void on_dash_update(lv_event_t *e)
+{
+    (void)e;
+    dash_request();
+}
+
+/* Rebuild the tile's words from the cached edition. LVGL task only. */
+static void render_dash(void)
+{
+    char sub[96] = "";
+    cJSON *root = s_dash_json && s_dash_json[0] ? cJSON_Parse(s_dash_json) : NULL;
+    if (root) {
+        cJSON *kind = cJSON_GetObjectItemCaseSensitive(root, "kind");
+        cJSON *updated = cJSON_GetObjectItemCaseSensitive(root, "updated");
+        const char *k = cJSON_IsString(kind) ? kind->valuestring : "";
+        const char *kn = !strcmp(k, "morning") ? "朝版" : !strcmp(k, "evening") ? "夕版" : "";
+        const char *up = cJSON_IsString(updated) ? updated->valuestring : "";
+        snprintf(sub, sizeof(sub), "%s%s%s", kn, kn[0] && up[0] ? "  " : "", up);
+    }
+    if (strcmp(sub, lv_label_get_text(s_dash_sub)) != 0) {
+        lv_label_set_text(s_dash_sub, sub);
+    }
+    const lv_font_t *font = caption_font();
+    lv_obj_clean(s_dash_box);
+    int y = 0;
+    cJSON *sections = root ? cJSON_GetObjectItemCaseSensitive(root, "sections") : NULL;
+    if (cJSON_IsArray(sections)) {
+        cJSON *sec;
+        cJSON_ArrayForEach(sec, sections) {
+            cJSON *t = cJSON_GetObjectItemCaseSensitive(sec, "t");
+            cJSON *lines = cJSON_GetObjectItemCaseSensitive(sec, "lines");
+            if (cJSON_IsString(t) && t->valuestring[0]) {
+                lv_obj_t *h = make_label(s_dash_box, font, COLOR_LIT);
+                lv_label_set_text(h, t->valuestring);
+                lv_obj_set_pos(h, 10, y);
+                lv_obj_update_layout(h);
+                y += lv_obj_get_height(h) + 4;
+            }
+            if (cJSON_IsArray(lines)) {
+                size_t used = 0;
+                s_dash_scratch[0] = '\0';
+                cJSON *line;
+                cJSON_ArrayForEach(line, lines) {
+                    if (!cJSON_IsString(line)) {
+                        continue;
+                    }
+                    size_t n = strlen(line->valuestring);
+                    if (used + n + 2 > DASH_CAP) {
+                        break;
+                    }
+                    memcpy(s_dash_scratch + used, line->valuestring, n);
+                    used += n;
+                    s_dash_scratch[used++] = '\n';
+                }
+                if (used) {
+                    s_dash_scratch[used - 1] = '\0';   /* no trailing newline */
+                    lv_obj_t *b = make_label(s_dash_box, font, COLOR_CAPTION);
+                    lv_obj_set_width(b, 320);
+                    lv_label_set_long_mode(b, LV_LABEL_LONG_MODE_WRAP);
+                    lv_label_set_text(b, s_dash_scratch);
+                    lv_obj_set_pos(b, 10, y);
+                    lv_obj_update_layout(b);
+                    y += lv_obj_get_height(b) + 14;
+                }
+            }
+        }
+    }
+    if (!y) {
+        lv_obj_t *none = make_label(s_dash_box, font, COLOR_DIM);
+        lv_label_set_text(none, root ? "表示できる項目がありません" : "まだ届いていません");
+        lv_obj_set_pos(none, 10, 0);
+    }
+    if (root) {
+        cJSON_Delete(root);
+    }
+}
+
+static void build_dash(lv_obj_t *tile)
+{
+    const lv_font_t *font = caption_font();
+    lv_obj_t *title = make_label(tile, font, COLOR_LIT);
+    lv_label_set_text(title, "ダッシュボード");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+    s_dash_sub = make_label(tile, font, COLOR_DIM);
+    lv_obj_align(s_dash_sub, LV_ALIGN_TOP_MID, 0, 74);
+    s_dash_state = make_label(tile, font, COLOR_DIM);
+    lv_obj_align(s_dash_state, LV_ALIGN_TOP_MID, 0, 100);
+    /* The edition, scrollable like a Settings page inside its tile. */
+    s_dash_box = lv_obj_create(tile);
+    lv_obj_remove_style_all(s_dash_box);
+    lv_obj_set_size(s_dash_box, 340, 246);
+    lv_obj_align(s_dash_box, LV_ALIGN_TOP_MID, 0, 128);
+    lv_obj_add_flag(s_dash_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_dash_box, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_dash_box, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_t *upd = hist_button(tile, font, "更新", on_dash_update);
+    lv_obj_set_size(upd, 124, 48);
+    lv_obj_align(upd, LV_ALIGN_BOTTOM_MID, 0, -30);
+
+    s_dash_json = heap_caps_malloc(DASH_CAP + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_dash_new = heap_caps_malloc(DASH_CAP + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_dash_env = heap_caps_malloc(DASH_ENV_CAP + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_dash_scratch = heap_caps_malloc(DASH_CAP + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_dash_go = xSemaphoreCreateBinary();
+    s_dash_done = xSemaphoreCreateBinary();
+    if (s_dash_json) {
+        s_dash_json[0] = '\0';   /* no edition yet, whatever else failed */
+    }
+    if (s_dash_json && s_dash_new && s_dash_env && s_dash_scratch && s_dash_go && s_dash_done) {
+        if (xTaskCreate(dash_fetch_task, "dash", 8192, NULL, tskIDLE_PRIORITY + 2, &s_dash_task) != pdPASS) {
+            s_dash_task = NULL;
+        }
+    }
+    render_dash();   /* the placeholder, until the first edition lands */
+}
+
+static void update_dash(void)
+{
+    if (!s_dash) return;
+    if (s_dash_wake) {
+        s_dash_wake = false;
+        dash_request();
+    }
+    bool on = s_tv && lv_tileview_get_tile_active(s_tv) == s_dash;
+    static bool was_on;
+    if (on && !was_on && (!s_dash_ok_us || esp_timer_get_time() - s_dash_ok_us > DASH_STALE_US)) {
+        dash_request();
+    }
+    was_on = on;
+    static bool was_busy;
+    if (s_dash_busy != was_busy) {
+        was_busy = s_dash_busy;
+        lv_label_set_text(s_dash_state, s_dash_busy ? "更新中…" : "");
+    }
+    if (s_dash_dirty) {
+        s_dash_dirty = false;
+        render_dash();
+    }
+}
 #endif
 
 static void build_screen(void)
@@ -1478,7 +1810,8 @@ static void build_screen(void)
 
     lv_obj_t *face = scr;
     if (muse_board->touch) {
-        /* Swipe left from Muse for settings. */
+        /* Swipe left from Muse for settings (museStopWatch: for the
+         * dashboard; Settings is one tile further, from quick settings). */
         s_tv = lv_tileview_create(scr);
         lv_obj_set_style_bg_color(s_tv, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_tv, LV_OPA_COVER, 0);
@@ -1512,6 +1845,17 @@ static void build_screen(void)
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        /* museStopWatch: the dashboard takes the settings tile's old place,
+         * right of the face. LV_DIR_RIGHT only: a left swipe from it must
+         * not slide on into Settings — that is the quick tile's 設定 button's
+         * job now (lv_tileview_set_tile is not bound by the dir mask). */
+        s_dash = lv_tileview_add_tile(s_tv, col++, row, LV_DIR_RIGHT);
+        lv_obj_set_scrollbar_mode(s_dash, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_style_bg_color(s_dash, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_dash, LV_OPA_COVER, 0);
+        build_dash(s_dash);
+#endif
         /* museStopWatch: LV_DIR_HOR as the launcher, so a swipe past the end is no tap. */
         s_settings = lv_tileview_add_tile(s_tv, col, row, s_launcher ? LV_DIR_HOR : LV_DIR_LEFT);
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
@@ -1870,7 +2214,8 @@ static void update_control_hints(muse_mode_t mode)
     /* Don't obscure settings rows/keyboards with floating physical icons.
      * museStopWatch: nor the app launcher (msw_launcher_build). */
     lv_obj_t *tile = s_tv ? lv_tileview_get_tile_active(s_tv) : NULL;
-    bool settings = tile && (tile == s_settings || tile == s_launcher || tile == s_quick || tile == s_history);
+    bool settings = tile && (tile == s_settings || tile == s_launcher || tile == s_quick || tile == s_history
+                             || tile == s_dash);
     lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, settings);
@@ -2023,6 +2368,9 @@ static bool update_sleep(void)
         s_dark = true;
     } else if (!asleep && s_dark) {
         s_dark = false;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        dash_note_wake();   /* the dashboard fetches a fresh edition on wake */
+#endif
         if (muse_board->panel_sleep) {
             muse_board->panel_sleep(false);
         }
@@ -2084,7 +2432,7 @@ static void update_chrome(float now)
 
     if (s_tv) {
         int tile = tile_page();
-        bool settings = tile == 2;
+        bool settings = lv_tileview_get_tile_active(s_tv) == s_settings;
         int page = s_launcher ? tile : settings;   /* the lit dot */
         bool subpage = muse_settings_ui_in_subpage();
         s_swipe_enabled = !settings || !subpage;
@@ -2097,7 +2445,14 @@ static void update_chrome(float now)
             }
             s_shown_page = shown;
         }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        /* The dashboard sits between the face and Settings: Settings counts
+         * as visible only while its own tile is up, not whenever the view
+         * is scrolled right of the face. */
+        muse_settings_ui_tick(settings);
+#else
         muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > face_scroll_x());
+#endif
     }
 
     /* Joining, the icon blinks: the compact layout has no state label. */
@@ -2678,6 +3033,7 @@ static void frame_tick(lv_timer_t *timer)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     update_history();
     update_quick();
+    update_dash();
 #endif
     update_status(mode, now);
 }

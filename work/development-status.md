@@ -1394,3 +1394,46 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
 - ホストテスト: tests.test_muse_watcher_controls 13件 OK、tests.test_muse_turn_sleep 3件 OK、
   tests.test_watcher_sleep_contract 8件 OK。
 - ビルドは CI で確認する（このあと push → run を最後まで見張る）。実機確認は OTA 後にユーザー。
+
+## 2026-11-15 — 0.3.0-dev.7
+
+ダッシュボードタイルとナビゲーション変更（ユーザー決定、FIRMWARE_IMPROVEMENT_NOTES.md の
+「ダッシュボード」節）。変更は muse_ui.c のみ（+ version.txt）。
+
+### ナビゲーション
+
+- 左スワイプ（顔の右隣）のタイルをダッシュボードに変更。設定タイルはさらに1つ右へ移動。
+- ダッシュボードタイルの dir は LV_DIR_RIGHT のみ: 左スワイプで設定へ滑り込まない。
+  設定へはクイック設定タイル（下スワイプ）の「設定」ボタンから
+  lv_tileview_set_tile で遷移する（dir マスクはプログラム遷移を縛らない）。
+- tile_page() はダッシュボードも 2（右ドット）を返す。update_chrome の settings 判定は
+  「設定タイルがアクティブか」に変更し、muse_settings_ui_tick の visible も
+  StopWatch では設定タイル基準にした（従来の scroll_x 基準だとダッシュボード表示中も
+  設定ページが tick してしまうため）。他ボードの挙動は不変。
+- 操作ヒント（物理ボタンのアイコン）を隠す対象タイルにダッシュボードを追加。
+
+### ダッシュボードタイル
+
+- ヘッダ: 「ダッシュボード」+ 版種（朝版/夕版）・updated、下に縦スクロール領域
+  （セクション見出し + lines を改行連結した本文）、下部に「更新」ボタン。
+  フォント/色は返信履歴タイルと同じ caption_font / COLOR_* を再利用。
+- 取得: 専用タスク "dash" が daemon request の POST /fs/read で VM ホームの
+  watch_edition.json を読む。len=1024 ずつ offset を進め、応答エンベロープ
+  {ok, result:{text|data_base64, eof}} を cJSON で解釈して eof まで連結（全体 8KB 上限、
+  PSRAM）。text が無ければ data_base64 を mbedtls で復号するフォールバックあり。
+  コールバック（セッションタスク上）はフレームを PSRAM バッファへコピーして
+  セマフォを渡すだけ。世代カウンタで stale フレームを捨てる。同時リクエストは1本のみ。
+- 取得トリガ: (1) 画面の wake 時（update_sleep の wake 辺でフラグ → update_dash が消費）、
+  (2) タイルを開いたときキャッシュが10分より古ければ、(3) 「更新」ボタン。
+  wake 直後はリンク未確立があり得るので、タスク側で req_ready を最大12秒待つ。
+- キャッシュ: 最後に成功した版を PSRAM に保持。取得失敗（404 = 版ファイル未生成を含む）
+  ではキャッシュをそのまま表示し、ダイアログは出さない。版が一度も無い場合は
+  「まだ届いていません」。キャッシュ差し替え前に JSON として parse 可能か検証する。
+- v1 は表示のみ（ToDo チェックなし）。版ファイルの生成（朝 07:30 / 夕 19:00）は Muse 側の別作業。
+
+### 検証
+
+- ホストテスト: tests.test_muse_watcher_controls 13件、tests.test_muse_turn_sleep 3件、
+  tests.test_watcher_sleep_contract 8件、全て OK（計24件）。
+- 実機未検証: ビルドは CI で確認する。/fs/read の到達性、タイル内スクロールと
+  タイルビューのジェスチャ競合、設定ボタンの遷移アニメーションは OTA 後にユーザーが確認する。
