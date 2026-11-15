@@ -1503,6 +1503,9 @@ static void update_quick(void)
  * Display only: nothing on the tile sends anything back. dev.8: the whole
  * fetch runs against one deadline (DASH_FETCH_DEADLINE_US) and logs its
  * stages (TAG "muse_ui", "dash: …"), so a stall resolves and says why.
+ * dev.10: the same stages also land in s_dash_err, and the tile shows the
+ * last one ("取得失敗: …") — the log is not readable off the device, the
+ * tile is.
  */
 #define DASH_PATH "watch_edition.json"
 #define DASH_CAP (8 * 1024)        /* the whole edition, at most */
@@ -1528,6 +1531,7 @@ static volatile bool s_dash_busy;
 static volatile bool s_dash_dirty;     /* the cache changed: re-render */
 static volatile bool s_dash_wake;      /* the screen woke: fetch (update_sleep) */
 static int64_t s_dash_ok_us;           /* the last successful fetch */
+static char s_dash_err[48];            /* dev.10: the last fetch's failure stage, "" if none */
 
 /* On the session task: copy the frame out and hand over, nothing more. */
 static void dash_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
@@ -1579,16 +1583,19 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
                                     (void *)(uintptr_t)s_dash_gen);
     if (!id) {
         ESP_LOGW(TAG, "dash: /fs/read open refused (session down or busy)");
+        snprintf(s_dash_err, sizeof(s_dash_err), "open refused");
         return false;
     }
     if (!muse_link_req_send(id, body, strlen(body), true, 2000)) {
         ESP_LOGW(TAG, "dash: /fs/read send failed at offset %u", (unsigned)offset);
+        snprintf(s_dash_err, sizeof(s_dash_err), "send failed");
         muse_link_req_cancel(id);
         return false;
     }
     if (xSemaphoreTake(s_dash_done, pdMS_TO_TICKS(DASH_CHUNK_WAIT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "dash: /fs/read no reply in %d ms at offset %u",
                  DASH_CHUNK_WAIT_MS, (unsigned)offset);
+        snprintf(s_dash_err, sizeof(s_dash_err), "no reply");
         muse_link_req_cancel(id);
         s_dash_gen++;   /* a late frame of this request drops, not lands in
                          * the next chunk's envelope */
@@ -1597,6 +1604,11 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
     if (s_dash_status != 200 || s_dash_env_over) {
         ESP_LOGW(TAG, "dash: /fs/read status %d%s at offset %u", s_dash_status,
                  s_dash_env_over ? " (reply too large)" : "", (unsigned)offset);
+        if (s_dash_env_over) {
+            snprintf(s_dash_err, sizeof(s_dash_err), "reply too large");
+        } else {
+            snprintf(s_dash_err, sizeof(s_dash_err), "status %d", s_dash_status);
+        }
         return false;
     }
     s_dash_env[s_dash_env_len] = '\0';
@@ -1637,6 +1649,7 @@ static bool dash_read_chunk(size_t offset, size_t *total, bool *eof)
     } else {
         ESP_LOGW(TAG, "dash: /fs/read reply at %u is not a usable envelope (%u bytes)",
                  (unsigned)offset, (unsigned)s_dash_env_len);
+        snprintf(s_dash_err, sizeof(s_dash_err), "bad envelope");
     }
     return ok;
 }
@@ -1657,9 +1670,13 @@ static void dash_fetch_task(void *arg)
         size_t total = 0;
         bool eof = false, ok = muse_link_req_ready();
         ESP_LOGI(TAG, "dash: fetch start (link %s)", ok ? "ready" : "down");
+        if (!ok) {
+            snprintf(s_dash_err, sizeof(s_dash_err), "link down");
+        }
         for (int i = 0; ok && !eof && i < 16; i++) {
             if (esp_timer_get_time() >= deadline) {
                 ESP_LOGW(TAG, "dash: fetch over its deadline at %u bytes", (unsigned)total);
+                snprintf(s_dash_err, sizeof(s_dash_err), "deadline");
                 ok = false;
                 break;
             }
@@ -1678,12 +1695,14 @@ static void dash_fetch_task(void *arg)
                 cJSON_Delete(probe);
                 memcpy(s_dash_json, s_dash_new, total + 1);
                 s_dash_ok_us = esp_timer_get_time();
+                s_dash_err[0] = '\0';   /* a full fetch landed: no failure to show */
                 s_dash_dirty = true;
                 cached = true;
                 ESP_LOGI(TAG, "dash: edition fetched, %u bytes", (unsigned)total);
             } else {
                 ESP_LOGW(TAG, "dash: fetched %u bytes but not JSON; cache kept",
                          (unsigned)total);
+                snprintf(s_dash_err, sizeof(s_dash_err), "not json");
             }
         }
         if (!cached) {
@@ -1840,7 +1859,17 @@ static void update_dash(void)
     static bool was_busy;
     if (s_dash_busy != was_busy) {
         was_busy = s_dash_busy;
-        lv_label_set_text(s_dash_state, s_dash_busy ? "更新中…" : "");
+        if (s_dash_busy) {
+            lv_label_set_text(s_dash_state, "更新中…");
+        } else if (s_dash_err[0]) {
+            /* dev.10: name the stage the fetch died at, on the tile itself —
+             * the "dash: …" log lines cannot be read off the device. */
+            char buf[64];
+            snprintf(buf, sizeof(buf), "取得失敗: %s", s_dash_err);
+            lv_label_set_text(s_dash_state, buf);
+        } else {
+            lv_label_set_text(s_dash_state, "");
+        }
     }
     if (s_dash_dirty) {
         s_dash_dirty = false;
