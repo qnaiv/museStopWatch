@@ -1325,3 +1325,6 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
   - 電池対策: 静かな待機 (IDLE・字幕なし・文字盤表示) が約10秒続いたらアバター描画を
     1/4 (約6fps) に間引く。それ以外は従来どおり 25fps。
   - ホストテスト test_muse_watcher_controls 13件 OK。ビルドは CI (run #7 以降) で確認する。
+- CI run #8 (2026-11-15、コミット 3a9bdc9): **成功**（check 7s / build 6m49s / release 9s）。
+  v0.3.0-dev.3 プレリリースが自動公開され、OTA 用 muse-gadget.bin (2.94 MB) を含む。
+  OTA はユーザーの「ファームを更新して」待ち。実機での見え方・操作感の確認もユーザー待ち。
