@@ -1296,3 +1296,10 @@ main へは入れていない。ビルド（GitHub Actions）と実機確認は�
   モデル取得成功、Build が 1 件だけエラーで失敗 — muse_ui.c:597 `muse_state_set_caption("")` の
   zero-length format string（-Werror=format-zero-length）。`"%s", ""` に直して main へ push 済み（run #5 で再試行）。
   署名鍵 Secret の登録有無という未確認事項はこれで解消。実機ファーム側の鍵との一致は OTA を試すまで未確認。
+- CI run #5（コミット 9f30231）: 前回のエラーは解消。新たなエラー 1 件で失敗 —
+  muse_review.c:229 `muse_chat_caption_page` の implicit declaration。宣言側
+  （muse_chat_priv.h）の `#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER` ガードを広げ忘れていた
+  （定義側 muse_chat_text.c は広げ済みだった）。宣言のガードに
+  `|| CONFIG_MUSE_BOARD_M5STACK_STOPWATCH` を追加して main へ push 済み（run #6 で再試行）。
+  あわせてヘッダ内の残ガードを点検: muse_board.h の REVIEW_PREV/NEXT は Watcher の
+  ロータリー専用で StopWatch 側は使わないため対象外。署名鍵チェック・モデル取得は run #5 でも成功。
