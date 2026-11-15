@@ -7,6 +7,9 @@ name: Firmware
 #    artifact (muse-gadget.bin for OTA, muse-gadget-core.bin for the first USB flash).
 #  - Push a tag such as v0.3.0 or v0.3.0-dev.1: the same files go to a GitHub
 #    Release (a tag with "-dev" is a pre-release).
+#  - Push to main when version.txt names a version that has no Release yet:
+#    the build runs and the Release (tag v<version>) is published automatically.
+#    A version bump is the release signal; code pushes without one are skipped.
 #
 # This repository is public, and so are its artifacts and releases. The
 # sanoTTS-jp model and dictionary have their own license (LICENSE-MODEL.md:
@@ -21,6 +24,7 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
@@ -30,7 +34,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Decides whether this run builds, and under which tag a Release would be
+  # published. Tag pushes and manual runs always build. A push to main builds
+  # only when version.txt names a version with no Release yet (the version
+  # bump is the release signal), so ordinary code pushes cost nothing.
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      needed: ${{ steps.decide.outputs.needed }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="$(tr -d ' \r\n' < muse-gadget-sdk/esp32/version.txt)"
+          tag="v$ver"
+          needed=true
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              needed=false
+            fi
+          fi
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "event=${{ github.event_name }} ref=${{ github.ref }} version=$ver tag=$tag needed=$needed"
+
   build:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: ubuntu-latest
     container: espressif/idf:v6.0.3
     timeout-minutes: 90
@@ -144,8 +183,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: github.event_name == 'push' && needs.check.outputs.needed == 'true'
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -157,9 +196,9 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           flags=()
           case "$TAG" in *-dev*) flags+=(--prerelease) ;; esac
-          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --target "${{ github.sha }}" \
             --notes "Muse StopWatch firmware $TAG. muse-gadget.bin is for OTA. muse-gadget-core.bin is for the first USB flash at offset 0x0; it does not contain the sanoTTS-jp model and dictionary (see docs/first-flash.md)." "${flags[@]}"
