@@ -209,7 +209,8 @@ static lv_obj_t *s_power_lbl;
 static lv_obj_t *s_caption_lbl;
 static int s_cap_h, s_cap_y;   /* the caption's built height and centre offset, to restore it */
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-static bool s_caption_full;    /* the kept reply is up full-screen, the avatar hidden */
+static lv_obj_t *s_full_lbl;   /* the reply label up large, Muse shrunk below it */
+static float s_full_since;     /* when the kept reply went up (auto-clears seconds later) */
 static lv_obj_t *s_quick_bright, *s_quick_bright_val, *s_quick_vol, *s_quick_vol_val;
 #endif
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
@@ -2395,28 +2396,41 @@ static void update_status(muse_mode_t mode, float now)
         lv_label_set_text(lbl, shown);
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
         {
-            /* A kept reply gets the whole screen: the caption band's two
-             * lines cut it off, so while one is up the label fills the
-             * face and the avatar steps aside (a tap dismisses it, as
-             * before). Hints keep the band, and anything else — a new
-             * turn above all — puts the face back. */
-            bool full = lbl == s_caption_lbl && shown[0] && mode == MUSE_MODE_IDLE && !muse_state_hint_pending();
-            if (full && !s_caption_full) {
-                s_caption_full = true;
-                lv_obj_set_size(s_caption_lbl, s_w - 32, s_h - 96);
-                lv_obj_align(s_caption_lbl, LV_ALIGN_TOP_MID, 0, 60);
-                lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_WRAP);
-                lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
-            } else if (!full && s_caption_full) {
-                s_caption_full = false;
-                lv_obj_set_size(s_caption_lbl, CAPTION_W, s_cap_h);
-                lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, s_cap_y);
-                lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
-                lv_obj_remove_flag(s_canvas, LV_OBJ_FLAG_HIDDEN);
+            /* While a reply is up — already while it is being read out,
+             * and after the turn as the kept caption — it gets most of
+             * the face, and Muse shrinks to the bottom instead of
+             * vanishing. Hints keep the band. The kept reply clears
+             * itself a few seconds after the turn ends (below) and a
+             * tap still dismisses it at once; the history tile keeps
+             * every reply either way. */
+            bool full = shown[0] && !muse_state_hint_pending()
+                        && ((lbl == s_caption_lbl && mode == MUSE_MODE_IDLE)
+                            || (lbl == s_reply_lbl && answer >= 0));
+            if (s_full_lbl && (s_full_lbl != lbl || !full)) {
+                if (s_full_lbl == s_caption_lbl) {
+                    lv_obj_set_size(s_caption_lbl, CAPTION_W, s_cap_h);
+                    lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, s_cap_y);
+                    lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
+                }
                 lv_obj_remove_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_remove_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
+                if (answer < 0) {
+                    move_muse(s_canvas_px, s_big_y);
+                }
+                s_full_lbl = NULL;
+                s_full_since = 0;
+            }
+            if (full && !s_full_lbl) {
+                s_full_lbl = lbl;
+                lv_obj_set_size(lbl, s_w - 32, s_h - 200);
+                lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 56);
+                lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
+                lv_obj_add_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
+                move_muse(s_canvas_px * 2 / 5, 168);
+                if (lbl == s_caption_lbl) {
+                    s_full_since = now;
+                }
             }
         }
 #endif
@@ -2437,6 +2451,15 @@ static void update_status(muse_mode_t mode, float now)
         s_caption_shown = shown[0] != '\0';
 #endif
     }
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* The kept reply has been read by now: clear it and give Muse the
+     * face back. It stays in the history tile. */
+    if (s_full_lbl == s_caption_lbl && s_full_since > 0 && mode == MUSE_MODE_IDLE
+        && now - s_full_since > 4.0f) {
+        s_full_since = 0;
+        muse_state_set_caption("%s", "");
+    }
+#endif
 #if CONFIG_MUSE_SMALL_FULL_REPLY
     if (s_small && !s_long) {
         apply_text_size();
