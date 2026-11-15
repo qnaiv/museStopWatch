@@ -1946,6 +1946,19 @@ static void build_clock(lv_obj_t *face)
     lv_obj_align(s_clock_box, LV_ALIGN_CENTER, 0, -6);
     s_clock_time = make_label(s_clock_box, FONT_CLOCK, 0xffffff);
     lv_label_set_text(s_clock_time, "--:--");
+    /* dev.15: Montserrat tops out at 48, so the time is drawn at 200%
+     * through a transform (the care ribbon already relies on transforms
+     * rendering on this build). The pivot is the label's centre, and
+     * symmetric vertical padding reserves the scaled height in the flex
+     * column, so the date and battery rows below keep clear of the
+     * enlarged digits instead of being overdrawn by them. */
+    lv_obj_set_style_transform_scale_x(s_clock_time, 512, 0);
+    lv_obj_set_style_transform_scale_y(s_clock_time, 512, 0);
+    lv_obj_set_style_transform_pivot_x(s_clock_time, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_clock_time, lv_pct(50), 0);
+    int clock_pad = lv_font_get_line_height(FONT_CLOCK) / 2;
+    lv_obj_set_style_pad_top(s_clock_time, clock_pad, 0);
+    lv_obj_set_style_pad_bottom(s_clock_time, clock_pad, 0);
     s_clock_date = make_label(s_clock_box, caption_font(), COLOR_LIT);
     s_clock_batt = make_label(s_clock_box, caption_font(), COLOR_DIM);
     lv_obj_add_flag(s_clock_box, LV_OBJ_FLAG_HIDDEN);
@@ -3027,22 +3040,10 @@ static void on_any_press(lv_event_t *e)
     muse_state_poke();
 }
 
-static lv_obj_t *make_control_icon(lv_obj_t *scr, const muse_button_hint_t *pos,
-                                   const char *symbol, uint32_t color)
-{
-    lv_obj_t *icon = make_label(scr, &lv_font_montserrat_28, color);
-    lv_obj_set_size(icon, 36, 36);
-    lv_obj_set_style_bg_color(icon, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(icon, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(icon, 6, 0);
-    lv_label_set_long_mode(icon, LV_LABEL_LONG_MODE_CLIP);
-    lv_label_set_text(icon, symbol);
-    lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(icon, pos->align, pos->x, pos->y);
-    return icon;
-}
-
-/* Icons only beside the physical controls, including before pairing. */
+/* Icons only beside the physical controls, including before pairing.
+ * dev.15: the hints are never created any more (see build_overlays), so
+ * on this fork's board s_ptt_hint stays NULL and this is a no-op; it is
+ * kept as the single guard every caller already goes through. */
 static void update_control_hints(muse_mode_t mode)
 {
     if (!s_ptt_hint) return;
@@ -3108,15 +3109,19 @@ static void build_overlays(void)
 #endif
 
     if (muse_board->rim_controls) {
-        /* Dedicated ownership: legacy chrome/reply hides must never claim it. */
-        s_ptt_hint = make_mic(scr, 26);
-        lv_obj_align(s_ptt_hint, muse_board->talk_hint.align, muse_board->talk_hint.x, muse_board->talk_hint.y);
-        s_spk_hint = make_control_icon(scr, &muse_board->speaker_hint, LV_SYMBOL_VOLUME_MID, 0xffd060);
-        s_pwr_hint = make_control_icon(scr, &muse_board->power_hint, LV_SYMBOL_POWER, 0xff8080);
+        /* dev.15: the dedicated rim icons that named the three physical
+         * controls (mic beside the talk button, speaker beside the mute
+         * button, power beside the power button) are gone at the user's
+         * request: the face shows the avatar and the real status chrome
+         * only. s_ptt_hint/s_spk_hint/s_pwr_hint are never created, so
+         * update_control_hints() no-ops. Live information is untouched:
+         * the header's Wi-Fi/BLE glyphs and state label, the transient
+         * SPEAKER ON/OFF caption on a mute toggle, and the quick tile's
+         * sound-mode buttons all stay. */
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
         /* During a push-to-talk call: what yellow does now, and that blue
-         * hangs up. Under each rim icon, pushed out towards the rim, clear of
-         * the avatar and its sparkles (CALL_HINT_OUT). */
+         * hangs up. Under each button's hint position, pushed out towards
+         * the rim, clear of the avatar and its sparkles (CALL_HINT_OUT). */
         const muse_button_hint_t *t = &muse_board->talk_hint, *k = &muse_board->speaker_hint;
         s_talk_hint_lbl = make_label(scr, &lv_font_montserrat_14, 0xffdc55);
         s_end_hint_lbl = make_label(scr, &lv_font_montserrat_14, 0x70baff);

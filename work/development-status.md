@@ -1748,3 +1748,55 @@ muse_ui.h / muse_input.c、devices/sdkconfig.musestopwatch
 - 実機未検証: ビルドは CI で確認する。OTA 後にユーザーが確認する
   項目: クイック設定の音モードボタン、黄色ボタンの時計モード、
   お世話パネル（餌やり／なでる）、進化アクセサリーの見え方。
+
+## 2026-11-16 — 0.3.0-dev.15
+
+ユーザーの音声メモ（2026-11-16 02:13）に基づく2点: ホーム画面の
+ボタン説明アイコンの削除と、時計モードの時刻拡大。変更は
+muse_ui.c、tests/test_stopwatch_controls.py（契約アサーションの
+追随）、version.txt。
+
+### dev.15-1: ホーム画面のボタン説明アイコンを削除
+
+- 顔タイル（ホーム画面）に物理ボタンの脇へ出ていた3つの専用リム
+  アイコン（マイク＝黄色ボタン、スピーカー＝青ボタン、電源＝赤
+  ボタン）を削除した。build_overlays() の rim_controls 分岐での
+  生成（s_ptt_hint / s_spk_hint / s_pwr_hint）をやめ、専用だった
+  make_control_icon() も除去した。
+- 消したのはこの3アイコンだけ。実情報の表示は残した: ヘッダーの
+  Wi-Fi / BLE グリフと状態ラベル、ミュート切替時の一時字幕
+  （SPEAKER ON/OFF）、クイック設定の音モードボタン、ページドット。
+  なおスピーカーアイコンはミュート状態も兼ねていたため、その常時
+  表示はなくなる（切替時字幕とクイック設定で代替）。
+- update_control_hints() と静的変数は残した（ヒントが生成されない
+  ため常に NULL ガードで no-op)。通話中ヒントラベル（TALK /
+  END CALL、REALTIME_VOICE 有効時のみ生成）はホーム画面のアイコン
+  ではないため対象外とし、無変更。
+- tests/test_stopwatch_controls.py の
+  test_positions_and_round_safe_area の契約アサーションを、アイコン
+  を生成しないことが新しい仕様として assertNotIn に反転した。
+
+### dev.15-2: 時計モードの時刻を拡大
+
+- dev.14 の時計モードの時刻（Montserrat 48）を、LVGL の transform
+  scale 200% で描画して実効約96pxにした（Montserrat のビルトインは
+  48 が最大で、より大きいフォント資産は無いため。transform は
+  dev.14 のリボン装飾で使用実績あり）。
+- ピボットはラベル中心。拡大分の高さ（フォント行高の半分ずつ）を
+  時刻ラベルの上下パディングとして flex レイアウトに予約し、下の
+  日付・バッテリー行と重ならないようにした。時計ボックス幅 380 に
+  対し拡大後の「HH:MM」は約270px幅で収まる。
+
+### 検証
+
+- ホストテスト: tests.test_muse_watcher_controls /
+  tests.test_muse_turn_sleep / tests.test_watcher_sleep_contract /
+  tests.test_muse_caption_wrap は全て OK。tests.test_stopwatch_power
+  は1件失敗、tests.test_stopwatch_controls /
+  tests.test_muse_caption_hint / tests.test_muse_ptt_ui は setUpClass
+  エラー、tests.test_muse_full_reply は4件失敗で、いずれも変更前の
+  ツリーでも同一に再現する既存の環境問題（stash で変更前後を比較し
+  結果が完全に同一であることを確認済み）。
+- 実機未検証: ビルドは CI で確認する。OTA 後にユーザーが確認する
+  項目: ホーム画面で3アイコンが消えていること、時計モードの時刻が
+  大きく読みやすく、日付・バッテリーと重なっていないこと。

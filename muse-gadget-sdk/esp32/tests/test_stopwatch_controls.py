@@ -346,12 +346,17 @@ int main(void) {
             self.assertGreater(y * sign_y, 0)
             for dx in [-18, 18]:
                 for dy in [-18, 18]: self.assertLess((x + dx) ** 2 + (y + dy) ** 2, 223 ** 2)
-        self.assertIn('s_ptt_hint = make_mic(scr, 26)', self.ui)
+        # dev.15: the rim icons naming the physical controls are no longer
+        # created on the face (user request); the hints stay NULL and
+        # update_control_hints() no-ops. The board's hint positions remain
+        # as data (the call-hint labels still anchor to them).
+        self.assertNotIn('s_ptt_hint = make_mic(scr, 26)', self.ui)
         self.assertNotIn('s_mic_icon = make_mic(scr', self.ui)
         self.assertNotIn('s_ptt_hint = s_mic_icon', self.ui)
         self.assertNotIn('s_ptt_hint', function(self.ui, 'add_hides'))
-        self.assertIn('make_control_icon(scr, &muse_board->speaker_hint, LV_SYMBOL_VOLUME_MID', self.ui)
-        self.assertIn('make_control_icon(scr, &muse_board->power_hint, LV_SYMBOL_POWER', self.ui)
+        self.assertNotIn('make_control_icon(scr, &muse_board->speaker_hint, LV_SYMBOL_VOLUME_MID', self.ui)
+        self.assertNotIn('make_control_icon(scr, &muse_board->power_hint, LV_SYMBOL_POWER', self.ui)
+        self.assertNotIn('make_control_icon', self.ui)
         self.assertNotRegex(function(self.ui, 'update_control_hints'), r'"(?:PTT|SPK|POWER|PRESS|HOLD)')
         self.assertIn('muse_board->rim_controls ? 280 : s_w', self.ui)
         self.assertIn('muse_board->rim_controls ? 64', self.ui)
