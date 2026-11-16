@@ -837,6 +837,107 @@ typedef struct {
     bool ok;
 } remove_req_t;
 
+/* ---- the host's store access (app.store_put / app.store_get, dev.17) ------
+ * The same files the app's own msw_store_put/get use (data/<id>/<key> on
+ * the apps volume), written and read for an app that need not be running,
+ * so Muse can hand an app new data between builds. The value moves through
+ * a copy in internal RAM, as msw_store_put's does: the service task writes
+ * flash, and the caller's buffer may be in PSRAM. */
+
+typedef struct {
+    char id[MSW_APP_ID_MAX];
+    char key[16];
+    void *data;   /* internal RAM */
+    size_t n;     /* put: the value's length; get: the buffer's room */
+    bool put;
+    int result;   /* bytes moved, or -1 io, -2 no such app, -3 no such key (get) */
+} host_store_req_t;
+
+/* The app API's key rules (msw_app_api.c's valid_key), for the host side. */
+static bool host_key_ok(const char *key)
+{
+    size_t n = strnlen(key, 16);
+    if (n == 0 || n > 15) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = key[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void host_store_io(void *arg)
+{
+    host_store_req_t *r = arg;
+    r->result = -1;
+    size_t pkg_n;
+    if (!s_mounted || !msw_pkgs_find(r->id, false, &pkg_n)) {
+        r->result = -2;
+        return;
+    }
+    char dir[64], path[96];
+    snprintf(dir, sizeof(dir), MSW_APP_DIR "/data/%s", r->id);
+    snprintf(path, sizeof(path), "%s/%s", dir, r->key);
+    if (r->put) {
+        mkdir(dir, 0775);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            bool ok = fwrite(r->data, 1, r->n, f) == r->n;
+            r->result = fclose(f) == 0 && ok ? (int)r->n : -1;
+        }
+    } else {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            r->result = (int)fread(r->data, 1, r->n, f);
+            fclose(f);
+        } else {
+            r->result = -3;
+        }
+    }
+}
+
+int msw_app_store_put(const char *id, const char *key, const void *data, size_t n)
+{
+    if (!id || !valid_id(id) || !key || !host_key_ok(key) || n > 4096 || (!data && n)) {
+        return -4;
+    }
+    void *copy = heap_caps_malloc(n ? n : 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!copy) {
+        return -1;
+    }
+    memcpy(copy, data, n);
+    host_store_req_t r = { .data = copy, .n = n, .put = true, .result = -1 };
+    strlcpy(r.id, id, sizeof(r.id));
+    strlcpy(r.key, key, sizeof(r.key));
+    msw_app_service(host_store_io, &r);
+    heap_caps_free(copy);
+    return r.result;
+}
+
+int msw_app_store_get(const char *id, const char *key, void *buf, size_t cap)
+{
+    if (!id || !valid_id(id) || !key || !host_key_ok(key) || !buf || !cap) {
+        return -4;
+    }
+    size_t n = cap > 4096 ? 4096 : cap;
+    void *copy = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!copy) {
+        return -1;
+    }
+    host_store_req_t r = { .data = copy, .n = n, .result = -1 };
+    strlcpy(r.id, id, sizeof(r.id));
+    strlcpy(r.key, key, sizeof(r.key));
+    msw_app_service(host_store_io, &r);
+    if (r.result > 0) {
+        memcpy(buf, copy, (size_t)r.result);
+    }
+    heap_caps_free(copy);
+    return r.result;
+}
+
 static void remove_package(void *arg)
 {
     remove_req_t *r = arg;

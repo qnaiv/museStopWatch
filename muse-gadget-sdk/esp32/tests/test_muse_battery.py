@@ -395,6 +395,107 @@ class BatteryTest(HarnessCase):
         # The head goes in before any lock, so only the lock list is short of room in the end.
         self.assertIn("heap", json.loads(outputs[len(caps) // 2]))
 
+class HistoryTest(HarnessCase):
+    """The history (dev.17): points from the readings, at their spacing, kept
+    across a boot in the same flash, and the JSON the watch uploads."""
+
+    E0 = 1763000000          # the harness's default wall clock (2025-11-13)
+    MIN = 60 * S             # one minute of esp_timer time
+
+    def test_first_reading_is_a_point(self) -> None:
+        hist, = self.run_harness("t 0", "p 0 100 4190", "hist")
+        self.assertEqual(hist["count"], 1)
+        self.assertEqual(hist["unsent"], 1)
+        self.assertEqual(hist["points"], [[self.E0, 100, 4, 0]])   # flags: clock real, not charging
+
+    def test_min_interval_and_half_hour(self) -> None:
+        hist, = self.run_harness(
+            "t 0", "p 0 100 4190",
+            "t %d" % (4 * self.MIN), "p 0 99 4190",      # too soon, and only 1 down
+            "t %d" % (6 * self.MIN), "p 0 99 4190",      # past 5 min, still nothing due
+            "t %d" % (30 * self.MIN), "e %d" % (self.E0 + 1800), "p 0 99 4190",
+            "hist")
+        self.assertEqual([p[1] for p in hist["points"]], [100, 99])
+        self.assertEqual(hist["points"][1][0], self.E0 + 1800)
+        self.assertEqual(hist["points"][1][3], 30)       # screen on the whole half hour
+
+    def test_big_move_and_charge_flip_record_sooner(self) -> None:
+        hist, = self.run_harness(
+            "t 0", "p 0 100 4190",
+            "t %d" % (6 * self.MIN), "p 0 94 4190",      # 6 down: a point
+            "t %d" % (12 * self.MIN), "p 1 94 4190 1",   # charging starts: a point
+            "t %d" % (18 * self.MIN), "p 1 96 4190 1",   # charging, 2 up: nothing due
+            "hist")
+        self.assertEqual([p[1] for p in hist["points"]], [100, 94, 94])
+        self.assertEqual(hist["points"][2][2] & 1, 1)    # the charging flag
+        self.assertEqual(hist["points"][2][2] & 2, 2)    # and USB
+
+    def test_screen_off_time_is_not_screen_on(self) -> None:
+        hist, = self.run_harness(
+            "t 0", "p 0 100 4190", "s 1 0",              # the screen goes off at once
+            "t %d" % (30 * self.MIN), "p 0 99 4190",
+            "hist")
+        self.assertEqual(hist["points"][1][3], 0)
+
+    def test_consumption_counts_drops_only(self) -> None:
+        hist, = self.run_harness(
+            "t 0", "e %d" % self.E0, "p 0 100 4190",
+            "t %d" % (30 * self.MIN), "e %d" % (self.E0 + 1800), "p 0 90 4190",
+            "t %d" % (60 * self.MIN), "e %d" % (self.E0 + 3600), "p 1 95 4190 1",
+            "t %d" % (90 * self.MIN), "e %d" % (self.E0 + 5400), "p 0 85 4190",
+            "hist")
+        self.assertEqual(hist["count"], 4)
+        self.assertEqual(hist["day"], 20)                # 10 + 10; the charge's rise is left out
+        self.assertEqual(hist["week"], 20)
+
+    def test_unreal_clock_is_flagged_and_skipped(self) -> None:
+        hist, = self.run_harness(
+            "t 0", "e 1000000", "p 0 100 4190",          # 1970: the clock is not real
+            "t %d" % (30 * self.MIN), "e 1001800", "p 0 90 4190",
+            "hist")
+        self.assertEqual(hist["count"], 2)
+        self.assertEqual(hist["points"][0][2] & 4, 0)    # no clock flag
+        self.assertEqual(hist["day"], -1)                # nothing countable in the span
+
+    def test_mark_sent(self) -> None:
+        hist, = self.run_harness("t 0", "p 0 100 4190", "sent", "hist")
+        self.assertEqual(hist["count"], 1)
+        self.assertEqual(hist["unsent"], 0)
+
+    def test_kept_in_flash_across_a_boot(self) -> None:
+        flash = str(Path(self.tmp.name) / "hist_flash")
+        Path(flash).unlink(missing_ok=True)
+        self.run_harness(f"flash {flash}", "t 0", "p 0 100 4190",
+                         "t %d" % (30 * self.MIN), "p 0 97 4190", "sent", "hist")
+        hist, = self.run_harness(f"flash {flash}", "t 0", "hist")
+        self.assertEqual([p[1] for p in hist["points"]], [100, 97])
+        self.assertEqual(hist["unsent"], 2)              # a boot owes an upload of what it loaded
+
+    def test_ring_wraps_at_a_week(self) -> None:
+        cmds = ["t 0", "e %d" % self.E0, "p 0 100 4190"]
+        for i in range(1, 340):                          # a point every 30 minutes
+            cmds += ["t %d" % (i * 30 * self.MIN), "e %d" % (self.E0 + i * 1800),
+                     "p 0 %d 4190" % (100 - (i % 40))]   # sawtooth, so drops count
+        hist, = self.run_harness(*cmds, "hist")
+        self.assertEqual(hist["count"], 336)
+        self.assertEqual(hist["points"][0][0], self.E0 + 4 * 1800)   # the oldest four are gone
+
+    def test_hist_json_shape(self) -> None:
+        raw, = self.run_harness_raw(
+            "t 0", "p 0 100 4190",
+            "t %d" % (30 * self.MIN), "e %d" % (self.E0 + 1800), "p 0 90 4190", "hj")
+        frag = json.loads("{" + raw + "}")
+        self.assertEqual(frag["points"], [[self.E0, 100, 0, 0], [self.E0 + 1800, 90, 0, 30]])
+        self.assertEqual(frag["run"]["battery_pct"], [100, 90])
+
+    def test_hist_json_cut_short_stays_valid(self) -> None:
+        for cap in (24, 60, 200):
+            raw, = self.run_harness_raw(
+                "t 0", "p 0 100 4190",
+                "t %d" % (30 * self.MIN), "p 0 90 4190", f"hj {cap}")
+            json.loads("{" + raw + "}")                  # parses, whatever it kept
+
+
 # The longest value each field of the JSON can take on the chip: unsigned and size_t are 32 bits
 # there, and so is long (sleep_rejects). Uptime and secs are microseconds since boot / 10^6.
 I32_MIN, I32_MAX, U32_MAX, I64_MAX = -2**31, 2**31 - 1, 2**32 - 1, 2**63 - 1

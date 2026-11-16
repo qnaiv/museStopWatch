@@ -1681,6 +1681,29 @@ static char *build_register_json(void) {
         cJSON_AddItemToObject(rm_req, "id", string_param("The app's id (app.list)."));
         add_command(commands, "app.remove", "Delete a mini app and its saved data.",
                     rm_req, nullptr);
+        cJSON *sp_req = cJSON_CreateObject();
+        cJSON_AddItemToObject(sp_req, "id", string_param("The app's id (app.list)."));
+        cJSON_AddItemToObject(sp_req, "key", string_param(
+            "Store key: 1-15 chars of [A-Za-z0-9_], the key the app reads with msw_store_get."));
+        cJSON_AddItemToObject(sp_req, "value", string_param(
+            "The value to store, at most 4096 bytes of UTF-8 text."));
+        add_command(commands, "app.store_put",
+                    "Write a value into an installed mini app's own store (the same "
+                    "storage its msw_store_put/get use), whether or not it is running. "
+                    "This is how data Muse keeps reaches an app between builds: the "
+                    "app reads the key when it starts. Errors: not_found (no such "
+                    "app), bad_param (a bad key, or a value over 4096 bytes).",
+                    sp_req, nullptr);
+        cJSON *sg_req = cJSON_CreateObject();
+        cJSON_AddItemToObject(sg_req, "id", string_param("The app's id (app.list)."));
+        cJSON_AddItemToObject(sg_req, "key", string_param(
+            "Store key: 1-15 chars of [A-Za-z0-9_], as written by the app or app.store_put."));
+        add_command(commands, "app.store_get",
+                    "Read a value from an installed mini app's own store (the same "
+                    "storage its msw_store_put/get use), whether or not it is running. "
+                    "Errors: not_found (no such app, or no value under that key), "
+                    "bad_param (a bad key).",
+                    sg_req, nullptr);
         cJSON *src_req = cJSON_CreateObject();
         cJSON_AddItemToObject(src_req, "id", string_param("The app's id (app.list)."));
         cJSON *src_opt = cJSON_Duplicate(offset, true);

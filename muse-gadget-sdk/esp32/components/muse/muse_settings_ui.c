@@ -148,6 +148,10 @@ static lv_obj_t *s_slpchk_checks[SLPCHK_COUNT];
 /* Battery page. */
 static lv_obj_t *s_batt_status, *s_batt_level, *s_batt_drain, *s_batt_full, *s_batt_off, *s_batt_slept, *s_batt_wakes,
     *s_batt_busy, *s_batt_awake;
+/* The history (dev.17): the last day's chart and the two drain rows. */
+static lv_obj_t *s_batt_chart, *s_batt_hist_note, *s_batt_day, *s_batt_week;
+static lv_chart_series_t *s_batt_series;
+static uint32_t s_batt_hist_sig;   /* count and last epoch, so the chart refills only on a new point */
 static int64_t s_batt_shown_us;
 
 /* Text entry page. */
@@ -1510,12 +1514,30 @@ static void on_battery_reset(lv_event_t *e)
     s_batt_shown_us = 0;   /* show it now */
 }
 
+#define BATT_CHART_POINTS 48   /* the last 24 hours at the history's 30-minute spacing */
+
 static void build_battery_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
     s_battery = page(tile, "BATTERY", true, &list);
     s_batt_shown_us = 0;
     s_batt_status = note(list, "");
+    /* dev.17: the history chart, at the head of the page. One series, the
+     * gauge itself; charging rises are in it (the note says so), coloured
+     * segments are v2 work. */
+    s_batt_chart = lv_chart_create(list);
+    lv_obj_set_size(s_batt_chart, 320, 110);
+    lv_obj_set_style_bg_color(s_batt_chart, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_border_width(s_batt_chart, 0, 0);
+    lv_chart_set_type(s_batt_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_axis_range(s_batt_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_chart_set_point_count(s_batt_chart, BATT_CHART_POINTS);
+    lv_chart_set_div_line_count(s_batt_chart, 3, 0);
+    s_batt_series = lv_chart_add_series(s_batt_chart, lv_color_hex(COLOR_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+    s_batt_hist_note = note(list, "過去24時間の推移（左が古い、充電中は上昇します）");
+    s_batt_day = info_row(list, "24時間の消費");
+    s_batt_week = info_row(list, "7日間の消費");
+    s_batt_hist_sig = 0;
     s_batt_level = info_row(list, "残量");   /* museStopWatch: Japanese */
     s_batt_drain = info_row(list, "使った量");
     s_batt_full = info_row(list, "満充電で");
@@ -1528,6 +1550,62 @@ static void build_battery_page(lv_obj_t *tile)
     note(list, "USB を抜いてから挿し直すまでを測ります。残量は 1% 刻みなので、数時間測ってください。"
                "画面オフ・チップ休止・CPU 稼働は、その状態だった時間の割合。"
                "チップ休止は省電力の眠り（ライトスリープ）、CPU 稼働はどれかのコアが処理をしていた時間です。");
+}
+
+/* dev.17: the chart (the last BATT_CHART_POINTS points, gaps before the
+ * first of them), the note's time range and the two drain rows; refilled
+ * only when a new point lands. Opening the page also asks muse_ui to upload
+ * the history for Muse (it throttles itself). */
+static void tick_battery_hist(void)
+{
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    muse_batt_hist_upload_request();   /* dev.17: the upload lives in muse_ui.c */
+#endif
+    int n = muse_battery_hist_count();
+    muse_batt_point_t last;
+    uint32_t sig = (uint32_t)n << 16 ^ (n && muse_battery_hist_get(n - 1, &last) ? last.epoch : 0);
+    if (sig == s_batt_hist_sig) {
+        return;
+    }
+    s_batt_hist_sig = sig;
+    int from = n > BATT_CHART_POINTS ? n - BATT_CHART_POINTS : 0;
+    int shown = n - from;
+    for (int i = 0; i < BATT_CHART_POINTS; i++) {
+        int32_t v = LV_CHART_POINT_NONE;
+        int idx = from + i - (BATT_CHART_POINTS - shown);   /* leading slots stay empty */
+        muse_batt_point_t pt;
+        if (idx >= from && muse_battery_hist_get(idx, &pt)) {
+            v = pt.pct;
+        }
+        lv_chart_set_series_value_by_id(s_batt_chart, s_batt_series, (uint32_t)i, v);
+    }
+    lv_chart_refresh(s_batt_chart);
+    char buf[96];
+    muse_batt_point_t first;
+    if (n >= 2 && muse_battery_hist_get(from, &first) && muse_battery_hist_get(n - 1, &last) &&
+        (first.flags & MUSE_BATT_HIST_FLAG_CLOCK) && (last.flags & MUSE_BATT_HIST_FLAG_CLOCK)) {
+        struct tm a, b;
+        time_t ta = (time_t)first.epoch, tb = (time_t)last.epoch;
+        if (localtime_r(&ta, &a) && localtime_r(&tb, &b)) {
+            snprintf(buf, sizeof(buf), "過去24時間の推移（%d:%02d → %d:%02d、充電中は上昇します）",
+                     a.tm_hour, a.tm_min, b.tm_hour, b.tm_min);
+            set_text(s_batt_hist_note, buf);
+        }
+    }
+    int day = muse_battery_hist_consumption(24 * 3600);
+    int week = muse_battery_hist_consumption(7 * 24 * 3600);
+    if (day >= 0) {
+        snprintf(buf, sizeof(buf), "-%d%%", day);
+        set_text(s_batt_day, buf);
+    } else {
+        set_text(s_batt_day, "-");
+    }
+    if (week >= 0) {
+        snprintf(buf, sizeof(buf), "-%d%%", week);
+        set_text(s_batt_week, buf);
+    } else {
+        set_text(s_batt_week, "-");
+    }
 }
 
 /* A per-mille figure as a percentage. */
@@ -1605,6 +1683,7 @@ static void tick_battery(void)
         snprintf(buf, sizeof(buf), "ほかに眠りを妨げたもの: %s", b.awake);
     }
     set_text(s_batt_awake, buf);
+    tick_battery_hist();
 }
 
 /* ---------- Power ---------- */

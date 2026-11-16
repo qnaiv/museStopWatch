@@ -1887,3 +1887,68 @@ muse_diy_stopwatch/miniapp/msw_app_launcher.c、version.txt。
   知らせること、時計モードに天気と次の予定が出る（バッテリー行が
   無い）こと、Settings > Yellow button で長押し割り当てが変わり
   再起動後も残ること。
+
+## 2026-11-16 — 0.3.0-dev.17
+
+バッテリー使用量の推移と、ToDo ミニアプリのライブ同期（ホスト→store
+書き込み）の2件。設計は work/battery-history-design-2026-11-16.md。
+
+### dev.17-1: バッテリー履歴
+
+- 記録: muse_battery_note_power() に相乗り（追加の起床ゼロ）。
+  30分経過／充電状態の反転／% が5以上変化で記録、最小間隔5分。
+  1点8バイト（epoch・%・充電/USB/時刻有効フラグ・前回記録以降の
+  画面点灯分）。リング336点＝7日分を PSRAM に持ち、記録のたびに
+  NVS 名前空間 muse_battery の blob "hist" へ全体を書き直す
+  （再起動・電池切れでも残る）。NVS が断片化で書けない場合は古い
+  半分を捨てて1回だけ再試行し、それでも駄目なら記録を諦める。
+  時刻が 2025-01-01 UTC 未満の点は「時刻不明」フラグで区別する。
+- 表示: 既存の Settings > Battery ページ冒頭に lv_chart の折れ線
+  （直近48点＝24時間、Y軸 0–100）と開始→終了時刻の note、
+  「24時間の消費」「7日間の消費」の集計行を追加。消費は隣接点の
+  下落分だけの合計（充電中の上昇と電圧換算の戻りは数えない）。
+- Muse 連携: muse_ui.c にアップロードタスクを追加。POST /fs/write
+  で workspace/battery_history.json（{"v":1,"fw","uploaded",
+  "points":[[epoch,pct,charging,scr_min],...],"run":{現在のラン集計}}）
+  を書き出す。本文は 6000 文字ずつに分け、初回 overwrite・後続
+  append。トリガーは Battery ページを開いたとき＋起床時に未送信分が
+  あるときで、スロットルは「成功から1時間（ただし未送信4点以上なら
+  前倒し）・試行間隔5分」。dash fetch と同時には走らない。失敗は
+  無言で次回に回す。
+
+### dev.17-2: ToDo ライブ同期（app.store_put / app.store_get）
+
+- デバイスコマンドを新設（msw_app_cmd.c、記述は main/noise_control.cpp）:
+  app.store_put {id, key, value} / app.store_get {id, key}。対象アプリ
+  の store（apps ボリュームの data/<id>/<key>、アプリ自身の
+  msw_store_put/get と同じファイル）を、アプリが動いていなくても
+  読み書きできる。キーは 1–15 文字の [A-Za-z0-9_]、値は最大4096
+  バイト。実体は msw_app_core.c の msw_app_store_put/get で、値は
+  内部 RAM のコピー経由で service タスクが読み書きする。
+  エラー: not_found（アプリ無し／キー無し）、bad_param、io_error。
+- apps/todo: 起動時に store の "todos_txt" を読み、値があればそれを
+  表示、無ければ同梱 data/todos.txt にフォールバックするよう更新。
+  形式は gen_data.py の出力と同じテキスト。Muse は ToDo を変えたら
+  app.store_put で "todos_txt" へ書けばよく、再ビルド＋再インストール
+  は不要になる（dev.17 の OTA 後から有効）。
+
+### 検証
+
+- ホストテスト: tests.test_muse_battery は 22→33 件（履歴の記録間隔・
+  反転/急変の記録・画面点灯分・消費集計・時刻不明フラグ・mark_sent・
+  flash を跨いだ保持・リングの巻き戻し・hist JSON の形と切り詰めを
+  追加）で全て OK。tests.test_link_daemon_requests /
+  tests.test_link_vm_api も OK。tests.test_reterminal_battery 1件・
+  tests.test_muse_full_reply 4件・tests.test_stopwatch_power 1件の
+  失敗と tests.test_stopwatch_controls / tests.test_muse_ptt_ui の
+  setUpClass エラーは、stash で変更前後を比較し変更前でも同一に
+  再現する既存の環境問題であることを確認済み（新規失敗ゼロ）。
+- apps/todo の新ビルド（12,510B）は dev.16 実機に入れ直し済みで、
+  同梱フォールバックで従来どおり表示・動作することを app.log で
+  確認（テストデータ3件で表示確認後、正本の空リスト版を再投入）。
+  store 読みは dev.16 では値が無いため未経路で、実機確認は dev.17
+  OTA 後。
+- 実機未検証（OTA 後、ユーザーが確認）: Battery ページのグラフと
+  集計行、workspace/battery_history.json が実際に書き出されること、
+  app.store_put した ToDo が次回起動時に表示されること、NVS 永続化と
+  スリープ中の記録間隔。

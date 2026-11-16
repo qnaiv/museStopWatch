@@ -81,3 +81,46 @@ int muse_battery_json(char *buf, size_t cap);
  * that resets when its port opens, or one that crashed on battery. It's
  * muse_battery_json() without "retention_free" and "retention_largest". */
 const char *muse_battery_saved_json(void);
+
+/*
+ * The history (dev.17): one point every 30 minutes at most, sooner when the
+ * charge state flips or the gauge moves 5 or more, never more often than
+ * every 5 minutes, taken from the readings muse_battery_note_power() already
+ * gets, so keeping it wakes nothing. 336 points at 30-minute spacing cover
+ * 7 days. The ring lives in PSRAM and is mirrored whole into the "hist" blob
+ * of the same NVS namespace on every point, so it survives reboots and a
+ * battery run flat. The gauge is a voltage estimate (see the board's
+ * read_power), so single points wobble with load; read slopes, not points.
+ */
+#define MUSE_BATT_HIST_MAX 336
+#define MUSE_BATT_HIST_FLAG_CHARGING 0x01
+#define MUSE_BATT_HIST_FLAG_USB 0x02
+#define MUSE_BATT_HIST_FLAG_CLOCK 0x04   /* epoch is real (SNTP/RTC), not 1970 */
+
+typedef struct {
+    uint32_t epoch;   /* time(NULL) at the reading */
+    int8_t pct;       /* 0-100 */
+    uint8_t flags;    /* MUSE_BATT_HIST_FLAG_* */
+    uint16_t scr_min; /* minutes the screen was on since the previous point */
+} muse_batt_point_t;
+
+/* Points held, oldest first: muse_battery_hist_get(0) is the oldest. */
+int muse_battery_hist_count(void);
+bool muse_battery_hist_get(int i, muse_batt_point_t *out);
+
+/* The net drain over the last span_s of points: the sum of the drops between
+ * neighbouring points, rises (charging, or the gauge recovering) left out.
+ * -1 when there are fewer than two points in the span. */
+int muse_battery_hist_consumption(int64_t span_s);
+
+/* Points recorded since the last muse_battery_hist_mark_sent(): what an
+ * upload still owes. A boot counts everything it loaded as unsent. */
+int muse_battery_hist_unsent(void);
+void muse_battery_hist_mark_sent(void);
+
+/* "\"points\":[[epoch,pct,charging,scr_min],...],\"run\":{...}" — the points
+ * oldest first (points whose clock was not real carry their raw epoch; the
+ * uploader drops them by the 2025 floor), then the current run's
+ * muse_battery_json(). Same cut-short rules as muse_battery_json(): whole
+ * pieces only, valid JSON however small cap is. Returns its length. */
+int muse_battery_hist_json(char *buf, size_t cap);

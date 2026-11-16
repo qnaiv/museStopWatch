@@ -115,6 +115,13 @@ bool msw_app_install_end(msw_app_inst_t *in, bool ok, char *id_out, uint16_t *ve
 bool msw_app_install(const uint8_t *data, size_t n, char *id_out, uint16_t *ver_out,
                      const char **code, char *msg, size_t msg_len);
 bool msw_app_remove(const char *id);
+/* The host's way into an app's store (app.store_put / app.store_get,
+ * dev.17): the same files the app's msw_store_put/get use, for an app that
+ * need not be running. put returns the bytes written; get the bytes read
+ * into buf (cap at most 4096 counts). Both: -1 io error, -2 no such app,
+ * -4 a bad id, key or value; get only: -3 no value under that key. */
+int msw_app_store_put(const char *id, const char *key, const void *data, size_t n);
+int msw_app_store_get(const char *id, const char *key, void *buf, size_t cap);
 bool msw_app_start(const char *id, const char **code, char *msg, size_t msg_len);
 void msw_app_stop(void);                     /* asks the running app to end; returns at once */
 const char *msw_app_running(void);           /* its id, or NULL */

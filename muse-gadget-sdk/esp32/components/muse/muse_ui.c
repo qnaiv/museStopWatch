@@ -35,6 +35,8 @@
 #include "src/draw/lv_image_decoder_private.h"   /* custom decoder */
 #include "src/misc/lv_area_private.h"            /* lv_area_intersect, for the ring */
 
+#include "esp_app_desc.h"   /* museStopWatch dev.17: the history upload names its firmware */
+#include "muse_battery.h"   /* museStopWatch dev.17: the battery history */
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_input.h"
@@ -3057,6 +3059,216 @@ static void update_dash(void)
         s_dash_dirty = false;
         render_dash();
     }
+    /* dev.17: a charge start (or anything else) that left history points
+     * unsent gets its upload at the next wake; the request throttles. */
+    muse_batt_hist_upload_request();
+}
+
+/*
+ * dev.17: the battery history upload, the dash fetch's mirror image. The
+ * points muse_battery keeps (muse_battery.h) go to BATT_HIST_PATH on the
+ * VM by POST /fs/write: the first piece overwrites, the rest append, each
+ * piece's text under the body bound (AGENTS.md). Muse reads the file when
+ * asked to analyse the battery. Triggers: Settings > Battery asks on open,
+ * update_dash() asks on wake; batt_hist_due() keeps both polite (an hour
+ * between uploads unless 4 or more points are owed, 5 minutes between
+ * attempts). Failures are silent and retried at the next ask. Never beside
+ * a dash fetch: the link allows 3 requests at once and the fetch matters
+ * more, so an upload that finds one running waits for the next ask.
+ */
+#define BATT_HIST_PATH "workspace/battery_history.json"
+#define BATT_HIST_CAP (16 * 1024)      /* the whole file text, at most */
+#define BATT_HIST_PIECE 6000           /* one /fs/write's text piece */
+#define BATT_HIST_ENV_CAP (BATT_HIST_PIECE * 2 + 256)   /* the piece, JSON-escaped, plus the envelope */
+#define BATT_HIST_FRESH_US (3600LL * 1000 * 1000)       /* an upload an hour old is fresh */
+#define BATT_HIST_RETRY_US (5LL * 60 * 1000 * 1000)     /* between attempts */
+
+static char *s_batt_hist_text;         /* PSRAM: the file being written */
+static char *s_batt_hist_env;          /* PSRAM: one request envelope */
+static char s_batt_hist_reply[1024];   /* one reply envelope (only its status is read) */
+static size_t s_batt_hist_env_len;
+static bool s_batt_hist_env_over;
+static int s_batt_hist_status;
+static uint32_t s_batt_hist_gen;
+static SemaphoreHandle_t s_batt_hist_go, s_batt_hist_done;
+static TaskHandle_t s_batt_hist_task;
+static volatile bool s_batt_hist_busy;
+static int64_t s_batt_hist_ok_us;      /* the last successful upload */
+static int64_t s_batt_hist_try_us;     /* the last attempt */
+
+/* On the session task: note the status, hand over, nothing more. */
+static void batt_hist_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
+{
+    if ((uint32_t)(uintptr_t)ctx != s_batt_hist_gen) {
+        return;
+    }
+    if (status != 0) {
+        s_batt_hist_status = status;
+    }
+    if (data && len) {
+        if (s_batt_hist_env_len + len < sizeof(s_batt_hist_reply)) {
+            memcpy(s_batt_hist_reply + s_batt_hist_env_len, data, len);
+            s_batt_hist_env_len += len;
+        } else {
+            s_batt_hist_env_over = true;
+        }
+    }
+    if (end || status < 0) {
+        xSemaphoreGive(s_batt_hist_done);
+    }
+}
+
+/* The file: the wrapper (version, firmware, upload time) around
+ * muse_battery_hist_json()'s points and run. False: nothing worth sending. */
+static bool batt_hist_build(void)
+{
+    int head = snprintf(s_batt_hist_text, BATT_HIST_CAP, "{\"v\":1,\"fw\":\"%s\",\"uploaded\":%lld,",
+                        esp_app_get_description()->version, (long long)time(NULL));
+    if (head < 0 || head >= BATT_HIST_CAP - 2) {
+        return false;
+    }
+    int n = muse_battery_hist_json(s_batt_hist_text + head, BATT_HIST_CAP - (size_t)head - 1);
+    if (n <= 0 || head + n >= BATT_HIST_CAP - 1) {
+        return false;
+    }
+    s_batt_hist_text[head + n] = '}';
+    s_batt_hist_text[head + n + 1] = '\0';
+    return true;
+}
+
+/* One /fs/write of text[0..n): the first piece overwrites, the rest append.
+ * The text is escaped into the envelope (the history is ASCII, but the run's
+ * lock names are text like any other). */
+static bool batt_hist_write_piece(const char *text, size_t n, bool first, int64_t deadline)
+{
+    char *e = s_batt_hist_env;
+    size_t cap = BATT_HIST_ENV_CAP, len = 0;
+    len += snprintf(e + len, cap - len, "{\"path\":\"" BATT_HIST_PATH "\",\"text\":\"");
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)text[i];
+        const char *esc = c == '"' ? "\\\"" : c == '\\' ? "\\\\" : NULL;
+        if (esc) {
+            if (len + 2 >= cap) {
+                return false;
+            }
+            e[len++] = esc[0];
+            e[len++] = esc[1];
+        } else if (c < 0x20) {
+            if (len + 6 >= cap) {
+                return false;
+            }
+            len += snprintf(e + len, cap - len, "\\u%04x", c);
+        } else {
+            if (len + 1 >= cap) {
+                return false;
+            }
+            e[len++] = (char)c;
+        }
+    }
+    len += snprintf(e + len, cap - len, "\",\"overwrite\":%s,\"append\":%s,\"create_parent\":true}",
+                    first ? "true" : "false", first ? "false" : "true");
+    if (len >= cap) {
+        return false;
+    }
+    char req_id[40];
+    snprintf(req_id, sizeof(req_id), "muse-%08" PRIx32 "-%08" PRIx32, esp_random(), esp_random());
+    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web",
+                              "Content-Type", "application/json",
+                              "Accept", "application/json", NULL };
+    s_batt_hist_gen++;
+    s_batt_hist_env_len = 0;
+    s_batt_hist_env_over = false;
+    s_batt_hist_status = 0;
+    xSemaphoreTake(s_batt_hist_done, 0);   /* drain a stale give */
+    int64_t id = muse_link_req_open("POST", "/fs/write", headers, false, batt_hist_on_frame,
+                                    (void *)(uintptr_t)s_batt_hist_gen);
+    if (!id) {
+        ESP_LOGW(TAG, "batt hist: /fs/write open refused (session down or busy)");
+        return false;
+    }
+    if (!muse_link_req_send(id, e, len, true, 2000)) {
+        ESP_LOGW(TAG, "batt hist: /fs/write send failed");
+        muse_link_req_cancel(id);
+        return false;
+    }
+    int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
+    int wait_ms = left_ms > DASH_CHUNK_WAIT_MS ? DASH_CHUNK_WAIT_MS : (int)left_ms;
+    if (wait_ms <= 0 || xSemaphoreTake(s_batt_hist_done, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "batt hist: /fs/write no reply in %d ms", wait_ms);
+        muse_link_req_cancel(id);
+        s_batt_hist_gen++;
+        return false;
+    }
+    if (s_batt_hist_status != 200 || s_batt_hist_env_over) {
+        ESP_LOGW(TAG, "batt hist: /fs/write status %d%s", s_batt_hist_status,
+                 s_batt_hist_env_over ? " (reply too large)" : "");
+        return false;
+    }
+    return true;
+}
+
+static void batt_hist_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(s_batt_hist_go, portMAX_DELAY);
+        s_batt_hist_try_us = esp_timer_get_time();
+        int64_t deadline = esp_timer_get_time() + DASH_FETCH_DEADLINE_US;
+        while (!muse_link_req_ready() && esp_timer_get_time() < deadline) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+        bool ok = false;
+        if (muse_link_req_ready() && !s_dash_busy && batt_hist_build()) {
+            size_t total = strlen(s_batt_hist_text);
+            ok = total > 0;
+            for (size_t off = 0; off < total && ok; off += BATT_HIST_PIECE) {
+                size_t n = total - off > BATT_HIST_PIECE ? BATT_HIST_PIECE : total - off;
+                ok = batt_hist_write_piece(s_batt_hist_text + off, n, off == 0, deadline);
+            }
+        }
+        if (ok) {
+            s_batt_hist_ok_us = esp_timer_get_time();
+            muse_battery_hist_mark_sent();
+            ESP_LOGI(TAG, "batt hist: history uploaded");
+        } else {
+            ESP_LOGW(TAG, "batt hist: upload failed; the next ask retries");
+        }
+        s_batt_hist_busy = false;
+    }
+}
+
+static bool batt_hist_due(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_batt_hist_busy || now - s_batt_hist_try_us < BATT_HIST_RETRY_US) {
+        return false;
+    }
+    int unsent = muse_battery_hist_unsent();
+    if (!unsent) {
+        return false;
+    }
+    return !s_batt_hist_ok_us || now - s_batt_hist_ok_us >= BATT_HIST_FRESH_US || unsent >= 4;
+}
+
+void muse_batt_hist_upload_request(void)
+{
+    if (!batt_hist_due()) {
+        return;
+    }
+    if (!s_batt_hist_task) {
+        s_batt_hist_text = heap_caps_malloc(BATT_HIST_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_batt_hist_env = heap_caps_malloc(BATT_HIST_ENV_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_batt_hist_go = xSemaphoreCreateBinary();
+        s_batt_hist_done = xSemaphoreCreateBinary();
+        if (!s_batt_hist_text || !s_batt_hist_env || !s_batt_hist_go || !s_batt_hist_done ||
+            xTaskCreate(batt_hist_task, "batthist", 8192, NULL, tskIDLE_PRIORITY + 2,
+                        &s_batt_hist_task) != pdPASS) {
+            s_batt_hist_task = NULL;
+            return;
+        }
+    }
+    s_batt_hist_busy = true;
+    xSemaphoreGive(s_batt_hist_go);
 }
 #endif
 

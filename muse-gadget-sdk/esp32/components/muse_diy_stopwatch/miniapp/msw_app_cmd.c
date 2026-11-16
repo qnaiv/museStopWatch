@@ -7,6 +7,7 @@
  *   app.list    installed apps and the running one
  *   app.run     start an app by id          app.stop   end the running one
  *   app.remove  delete an app by id         app.log    the app log
+ *   app.store_put / app.store_get  write/read an app's own store (dev.17)
  *   app.source  the app's files kept in its package (sdk/build.py adds them)
  *   app.screenshot  the screen as a JPEG, base64 (like camera.capture)
  *   app.avatar_doc, app.avatar_list, app.avatar_preview, app.avatar_use
@@ -346,6 +347,63 @@ cJSON *msw_app_command(const char *command, const cJSON *params)
         }
         cJSON *payload;
         return ok_payload(&payload);
+    }
+    if (!strcmp(c, "store_put")) {
+        const char *id = str(params, "id");
+        const char *key = str(params, "key");
+        const cJSON *v = params ? cJSON_GetObjectItemCaseSensitive(params, "value") : NULL;
+        if (!id || !key || !cJSON_IsString(v)) {
+            return fail("missing_param", "id, key and value are required");
+        }
+        int n = msw_app_store_put(id, key, v->valuestring, strlen(v->valuestring));
+        if (n == -2) {
+            return fail("not_found", "no app with that id");
+        }
+        if (n == -4) {
+            return fail("bad_param", "key must be 1-15 chars of [A-Za-z0-9_], value at most 4096 bytes");
+        }
+        if (n < 0) {
+            return fail("io_error", "could not write the value");
+        }
+        cJSON *payload;
+        cJSON *r = ok_payload(&payload);
+        cJSON_AddStringToObject(payload, "id", id);
+        cJSON_AddStringToObject(payload, "key", key);
+        cJSON_AddNumberToObject(payload, "bytes", n);
+        return r;
+    }
+    if (!strcmp(c, "store_get")) {
+        const char *id = str(params, "id");
+        const char *key = str(params, "key");
+        if (!id || !key) {
+            return fail("missing_param", "id and key are required");
+        }
+        char *buf = heap_caps_malloc(4097, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            return fail("out_of_memory", "out of memory");
+        }
+        int n = msw_app_store_get(id, key, buf, 4096);
+        if (n == -2 || n == -3) {
+            free(buf);
+            return fail("not_found", n == -2 ? "no app with that id" : "no value under that key");
+        }
+        if (n == -4) {
+            free(buf);
+            return fail("bad_param", "key must be 1-15 chars of [A-Za-z0-9_]");
+        }
+        if (n < 0) {
+            free(buf);
+            return fail("io_error", "could not read the value");
+        }
+        buf[n] = '\0';
+        cJSON *payload;
+        cJSON *r = ok_payload(&payload);
+        cJSON_AddStringToObject(payload, "id", id);
+        cJSON_AddStringToObject(payload, "key", key);
+        cJSON_AddStringToObject(payload, "value", buf);
+        free(buf);
+        cJSON_AddNumberToObject(payload, "bytes", n);
+        return r;
     }
     if (!strcmp(c, "source")) {
         const char *id = str(params, "id");

@@ -16,8 +16,9 @@
 
 /* Drives the battery meter (muse_battery.c) for test_muse_battery.py, one command a line:
  *   t <us>                 the clock
+ *   e <epoch>              the wall clock time() returns (the history's stamps)
  *   dump ... end           the lines esp_pm_dump_locks() prints from now on
- *   p <usb> <pct> <mv>     a battery reading
+ *   p <usb> <pct> <mv> [<charging>]   a battery reading
  *   s <off> <resting>      the screen and CPU state
  *   w <us>                 a wake from light sleep, after <us> asleep
  *   h <free> <min> <largest> [<ret_free> <ret_largest>]   internal RAM: free now, lowest since boot,
@@ -29,6 +30,9 @@
  *   j [<cap>]              prints muse_battery_json(), into 2048 bytes or <cap>
  *   r                      prints muse_battery_read() as JSON
  *   k                      prints muse_battery_saved_json(), or null
+ *   hist                   prints the history: count, unsent, the points, the day/week drain
+ *   hj [<cap>]             prints muse_battery_hist_json(), into 12288 bytes or <cap>
+ *   sent                   muse_battery_hist_mark_sent()
  *   rtc                    prints the record in RTC memory now, as the next boot would find it
  *   save <file>            writes the RTC memory, for a later run to boot with
  * and before any of those, a boot:
@@ -47,7 +51,17 @@
 #include "muse_battery.c"
 
 static int64_t s_clock;
+static time_t s_epoch = 1763000000;   /* 2025-11-13: a real clock, unless "e" says else */
 static esp_reset_reason_t s_boot_reason = ESP_RST_POWERON;
+
+/* The history stamps its points with time(); the harness owns the wall clock. */
+time_t time(time_t *t)
+{
+    if (t) {
+        *t = s_epoch;
+    }
+    return s_epoch;
+}
 
 esp_reset_reason_t esp_reset_reason(void)
 {
@@ -90,13 +104,15 @@ esp_err_t esp_pm_dump_locks(FILE *stream)
     return ESP_OK;
 }
 
-/* One namespace, a few keys; a u16 is a two-byte blob. */
+/* One namespace, a few keys; a u16 is a two-byte blob. A value holds the
+ * largest blob the meter writes: the history's 8-byte header and 336 points. */
+#define NVS_VALUE_MAX (8 + 336 * 8)
 typedef struct {
     char key[16];
     size_t len;
-    char value[SAVED_MAX];
+    char value[NVS_VALUE_MAX];
 } nvs_key_t;
-static nvs_key_t s_nvs_keys[4];
+static nvs_key_t s_nvs_keys[6];
 static char s_flash[512];
 
 static nvs_key_t *nvs_find(const char *key, bool add)
@@ -226,16 +242,19 @@ int main(void)
         }
         if (!strncmp(line, "t ", 2)) {
             s_clock = strtoll(line + 2, NULL, 10);
+        } else if (!strncmp(line, "e ", 2)) {
+            s_epoch = (time_t)strtoll(line + 2, NULL, 10);
         } else if (!strcmp(line, "dump")) {
             s_dump_text[0] = '\0';
             while (fgets(line, sizeof(line), stdin) && strcmp(line, "end\n")) {
                 strlcat(s_dump_text, line, sizeof(s_dump_text));
             }
         } else if (!strncmp(line, "p ", 2)) {
-            int usb;
+            int usb, charging = 0;
             muse_power_t p = { 0 };
-            sscanf(line + 2, "%d %d %d", &usb, &p.battery_pct, &p.battery_mv);
+            sscanf(line + 2, "%d %d %d %d", &usb, &p.battery_pct, &p.battery_mv, &charging);
             p.usb = usb;
+            p.charging = charging;
             muse_battery_note_power(&p, !p.usb && p.battery_pct >= 0);
         } else if (!strncmp(line, "s ", 2)) {
             int off, resting;
@@ -288,6 +307,33 @@ int main(void)
         } else if (!strcmp(line, "k")) {
             const char *saved = muse_battery_saved_json();
             puts(saved ? saved : "null");
+        } else if (!strcmp(line, "hist")) {
+            printf("{\"count\":%d,\"unsent\":%d,\"points\":[", muse_battery_hist_count(),
+                   muse_battery_hist_unsent());
+            for (int i = 0; i < muse_battery_hist_count(); i++) {
+                muse_batt_point_t pt;
+                muse_battery_hist_get(i, &pt);
+                printf("%s[%u,%d,%u,%u]", i ? "," : "", (unsigned)pt.epoch, (int)pt.pct,
+                       (unsigned)pt.flags, (unsigned)pt.scr_min);
+            }
+            printf("],\"day\":%d,\"week\":%d}\n", muse_battery_hist_consumption(86400),
+                   muse_battery_hist_consumption(7 * 86400));
+        } else if (!strcmp(line, "hj") || !strncmp(line, "hj ", 3)) {
+            static char json[12288 + 1];
+            size_t cap = line[2] ? strtoul(line + 3, NULL, 10) : 12288;
+            if (cap > sizeof(json) - 1) {
+                fprintf(stderr, "hj: at most %zu\n", sizeof(json) - 1);
+                return 2;
+            }
+            memset(json, '#', sizeof(json));
+            int len = muse_battery_hist_json(json, cap);
+            if (cap && (len < 0 || (size_t)len >= cap || json[len] || json[cap] != '#')) {
+                fprintf(stderr, "muse_battery_hist_json(%zu) wrote %d bytes, or past them\n", cap, len);
+                return 2;
+            }
+            puts(cap ? json : "");
+        } else if (!strcmp(line, "sent")) {
+            muse_battery_hist_mark_sent();
         } else if (!strncmp(line, "save ", 5)) {
             FILE *f = fopen(line + 5, "wb");
             if (!f || fwrite(&s_saved, sizeof(s_saved), 1, f) != 1) {

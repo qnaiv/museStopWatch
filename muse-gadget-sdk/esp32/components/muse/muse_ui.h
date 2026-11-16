@@ -57,6 +57,11 @@ enum { MUSE_YEL_LONG_TIMER = 0, MUSE_YEL_LONG_APP = 1, MUSE_YEL_LONG_FACE = 2, M
 int muse_ui_yellow_long_action(void);
 const char *muse_ui_yellow_long_app(void);   /* the app id for MUSE_YEL_LONG_APP */
 void muse_ui_set_yellow_long(int action, const char *app_id);
+/* museStopWatch dev.17: ask for the battery history to be uploaded to the
+ * VM (workspace/battery_history.json) so Muse can analyse it. Cheap to
+ * call often (the Battery page's tick does): it starts nothing while an
+ * upload is recent, running, or barely owed. */
+void muse_batt_hist_upload_request(void);
 #endif
 /* Settings sub-pages turn off the tile swipe so they can use horizontal gestures. */
 void muse_ui_set_swipe_enabled(bool enabled);

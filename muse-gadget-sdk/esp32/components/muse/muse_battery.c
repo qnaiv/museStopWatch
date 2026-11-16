@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
@@ -393,6 +394,234 @@ static uint32_t checksum(const char *p, size_t n)
     return h;
 }
 
+/* ---- the history (dev.17) ------------------------------------------------
+ * Points from the readings note_power() already takes; see muse_battery.h.
+ * The ring is in PSRAM; the NVS blob "hist" is its mirror (a small header,
+ * then the points oldest first), rewritten whole on every point, like the
+ * "run" blob is. */
+
+#define HIST_EVERY_US (30LL * 60 * 1000 * 1000)   /* the usual spacing */
+#define HIST_MIN_US (5LL * 60 * 1000 * 1000)      /* never closer than this */
+#define HIST_MAGIC 0x48495354                     /* "HIST" */
+#define HIST_CLOCK_FLOOR 1735689600               /* 2025-01-01 UTC: below it the clock is not real */
+
+typedef struct {
+    uint32_t magic;
+    uint16_t count, reserved;
+} hist_hdr_t;
+
+static muse_batt_point_t *s_hist;        /* PSRAM ring, MUSE_BATT_HIST_MAX */
+static uint8_t *s_hist_flat;             /* PSRAM: the blob as it lies in NVS */
+static char *s_hist_scratch;             /* PSRAM: the run JSON, for hist_json */
+static int s_hist_head;                  /* the oldest point's slot */
+static int s_hist_count;
+static int64_t s_hist_last_us;           /* esp_timer at the last point; -1 none (set at init) */
+static int s_hist_last_pct;
+static bool s_hist_last_charging;
+static int64_t s_hist_last_off_us;       /* s_off_us at the last point */
+static int s_hist_unsent;
+static bool s_hist_fresh;                /* no point yet this boot: the next reading is one */
+
+/* With s_lock held; i from the oldest. */
+static const muse_batt_point_t *hist_at(int i)
+{
+    return &s_hist[(s_hist_head + i) % MUSE_BATT_HIST_MAX];
+}
+
+/* With s_lock held. The whole ring into NVS, oldest first. On fragmented
+ * flash (ESP_ERR_NVS_NOT_ENOUGH_SPACE) the older half goes and it retries
+ * once; still no room, the ring keeps the points and a later point retries. */
+static void hist_save(void)
+{
+    if (!s_nvs || !s_hist) {
+        return;
+    }
+    for (int tries = 0; tries < 2; tries++) {
+        hist_hdr_t *h = (hist_hdr_t *)s_hist_flat;
+        h->magic = HIST_MAGIC;
+        h->count = (uint16_t)s_hist_count;
+        h->reserved = 0;
+        muse_batt_point_t *pts = (muse_batt_point_t *)(s_hist_flat + sizeof(hist_hdr_t));
+        for (int i = 0; i < s_hist_count; i++) {
+            pts[i] = *hist_at(i);
+        }
+        size_t len = sizeof(hist_hdr_t) + (size_t)s_hist_count * sizeof(muse_batt_point_t);
+        esp_err_t err = nvs_set_blob(s_nvs, "hist", s_hist_flat, len);
+        if (err == ESP_OK) {
+            nvs_commit(s_nvs);
+            return;
+        }
+        if (err != ESP_ERR_NVS_NOT_ENOUGH_SPACE || tries) {
+            ESP_LOGW(TAG, "history save: %s", esp_err_to_name(err));
+            return;
+        }
+        int drop = s_hist_count / 2;
+        s_hist_head = (s_hist_head + drop) % MUSE_BATT_HIST_MAX;
+        s_hist_count -= drop;
+        if (s_hist_unsent > s_hist_count) {
+            s_hist_unsent = s_hist_count;
+        }
+        ESP_LOGW(TAG, "history save: no room, dropped the older %d points", drop);
+    }
+}
+
+/* At init, with the namespace open: the ring back from its mirror. */
+static void hist_load(void)
+{
+    if (!s_nvs) {
+        return;
+    }
+    size_t cap = sizeof(hist_hdr_t) + MUSE_BATT_HIST_MAX * sizeof(muse_batt_point_t);
+    size_t len = 0;
+    if (nvs_get_blob(s_nvs, "hist", NULL, &len) != ESP_OK || len < sizeof(hist_hdr_t) || len > cap) {
+        return;
+    }
+    if (nvs_get_blob(s_nvs, "hist", s_hist_flat, &len) != ESP_OK) {
+        return;
+    }
+    hist_hdr_t *h = (hist_hdr_t *)s_hist_flat;
+    int n = h->count;
+    if (h->magic != HIST_MAGIC || n > MUSE_BATT_HIST_MAX ||
+        len < sizeof(hist_hdr_t) + (size_t)n * sizeof(muse_batt_point_t)) {
+        return;
+    }
+    muse_batt_point_t *pts = (muse_batt_point_t *)(s_hist_flat + sizeof(hist_hdr_t));
+    for (int i = 0; i < n; i++) {
+        s_hist[i] = pts[i];
+    }
+    s_hist_head = 0;
+    s_hist_count = n;
+    s_hist_unsent = n;   /* a boot owes an upload of what it loaded */
+    if (n) {
+        const muse_batt_point_t *last = hist_at(n - 1);
+        s_hist_last_pct = last->pct;
+        s_hist_last_charging = last->flags & MUSE_BATT_HIST_FLAG_CHARGING;
+    }
+    ESP_LOGI(TAG, "history: %d points loaded", n);
+}
+
+/* With s_lock held, from note_power(): a point when one is due. */
+static void hist_note(const muse_power_t *p)
+{
+    if (!s_hist || p->battery_pct < 0) {
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (!s_hist_fresh) {
+        if (now - s_hist_last_us < HIST_MIN_US) {
+            return;
+        }
+        int dpct = p->battery_pct - s_hist_last_pct;
+        if (dpct < 0) {
+            dpct = -dpct;
+        }
+        if (!p->charging == !s_hist_last_charging && dpct < 5 && now - s_hist_last_us < HIST_EVERY_US) {
+            return;   /* no flip, the gauge barely moved, the half hour not up */
+        }
+    }
+    /* Screen-on minutes since the last point: the elapsed time the run's
+     * screen-off counter did not cover. Bring the counter up to now first
+     * (it otherwise moves only when the state changes or the run is read).
+     * A run boundary in between restarts s_off_us; then the whole counter
+     * is this point's share. The boot point (s_hist_last_us 0) claims none. */
+    accrue(now);
+    int64_t off_delta = s_off_us - s_hist_last_off_us;
+    if (off_delta < 0) {
+        off_delta = s_off_us;
+    }
+    int64_t on_min = 0;
+    if (s_hist_last_us >= 0) {
+        int64_t on_us = now - s_hist_last_us - off_delta;
+        on_min = on_us > 0 ? on_us / (60LL * 1000 * 1000) : 0;
+        if (on_min > 0xFFFF) {
+            on_min = 0xFFFF;
+        }
+    }
+    time_t epoch = time(NULL);
+    muse_batt_point_t pt;
+    pt.epoch = epoch > 0 ? (uint32_t)epoch : 0;
+    pt.pct = (int8_t)p->battery_pct;
+    pt.flags = (uint8_t)((p->charging ? MUSE_BATT_HIST_FLAG_CHARGING : 0) |
+                         (p->usb ? MUSE_BATT_HIST_FLAG_USB : 0) |
+                         (epoch >= HIST_CLOCK_FLOOR ? MUSE_BATT_HIST_FLAG_CLOCK : 0));
+    pt.scr_min = (uint16_t)on_min;
+    if (s_hist_count == MUSE_BATT_HIST_MAX) {
+        s_hist_head = (s_hist_head + 1) % MUSE_BATT_HIST_MAX;
+        s_hist_count--;
+        if (s_hist_unsent > s_hist_count) {
+            s_hist_unsent = s_hist_count;
+        }
+    }
+    s_hist[(s_hist_head + s_hist_count) % MUSE_BATT_HIST_MAX] = pt;
+    s_hist_count++;
+    s_hist_unsent++;
+    s_hist_last_us = now;
+    s_hist_last_pct = p->battery_pct;
+    s_hist_last_charging = p->charging;
+    s_hist_last_off_us = s_off_us;
+    s_hist_fresh = false;
+    hist_save();
+}
+
+int muse_battery_hist_count(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int n = s_hist_count;
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+bool muse_battery_hist_get(int i, muse_batt_point_t *out)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = s_hist && i >= 0 && i < s_hist_count;
+    if (ok) {
+        *out = *hist_at(i);
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
+}
+
+int muse_battery_hist_consumption(int64_t span_s)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int out = -1;
+    if (s_hist_count >= 2) {
+        int64_t floor = (int64_t)time(NULL) - span_s;
+        int total = 0, pairs = 0;
+        for (int i = 1; i < s_hist_count; i++) {
+            const muse_batt_point_t *a = hist_at(i - 1), *b = hist_at(i);
+            if (!(b->flags & MUSE_BATT_HIST_FLAG_CLOCK) || (int64_t)b->epoch < floor) {
+                continue;
+            }
+            if (a->pct > b->pct) {
+                total += a->pct - b->pct;   /* rises are charging or gauge bounce: left out */
+            }
+            pairs++;
+        }
+        if (pairs) {
+            out = total;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return out;
+}
+
+int muse_battery_hist_unsent(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int n = s_hist_unsent;
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+void muse_battery_hist_mark_sent(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_hist_unsent = 0;
+    xSemaphoreGive(s_lock);
+}
+
 void muse_battery_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
@@ -417,6 +646,12 @@ void muse_battery_init(void)
     s_start = alloc(sizeof(snap_t));
     s_end = alloc(sizeof(snap_t));
     s_now = alloc(sizeof(snap_t));
+    s_hist = alloc(MUSE_BATT_HIST_MAX * sizeof(muse_batt_point_t));
+    s_hist_flat = alloc(sizeof(hist_hdr_t) + MUSE_BATT_HIST_MAX * sizeof(muse_batt_point_t));
+    s_hist_scratch = alloc(SAVED_MAX + 1);
+    s_hist_fresh = true;
+    s_hist_last_us = -1;
+    hist_load();
 #if CONFIG_PM_PROFILING
     s_dump = alloc(DUMP_MAX);
 #endif
@@ -458,6 +693,7 @@ void muse_battery_note_power(const muse_power_t *p, bool on_battery)
             persist(true);
         }
     }
+    hist_note(p);
     xSemaphoreGive(s_lock);
 }
 
@@ -673,4 +909,33 @@ void muse_battery_note_cpu_pd(bool on)
 const char *muse_battery_saved_json(void)
 {
     return s_prev;
+}
+
+/* The history as one fragment (the uploader wraps it with "v", "fw" and
+ * "uploaded"): the points oldest first, then the run. The run is made in its
+ * own scratch and appended whole, so a small cap loses it, never halves it;
+ * a point that doesn't fit ends the list, which still closes. */
+int muse_battery_hist_json(char *buf, size_t cap)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    out_t o = { .buf = buf, .cap = cap };
+    if (cap) {
+        buf[0] = '\0';
+    }
+    add(&o, 1, "\"points\":[");
+    bool listed = !o.cut;
+    for (int i = 0; i < s_hist_count; i++) {
+        const muse_batt_point_t *pt = hist_at(i);
+        add(&o, 2, "%s[%u,%d,%d,%u]", i ? "," : "", (unsigned)pt->epoch, (int)pt->pct,
+            pt->flags & MUSE_BATT_HIST_FLAG_CHARGING ? 1 : 0, (unsigned)pt->scr_min);
+    }
+    if (listed) {
+        close_with(&o, ']');
+    }
+    if (s_hist_scratch) {
+        json(s_hist_scratch, SAVED_MAX + 1, false);
+        add(&o, 1, ",\"run\":%s", s_hist_scratch);
+    }
+    xSemaphoreGive(s_lock);
+    return (int)o.len;
 }
