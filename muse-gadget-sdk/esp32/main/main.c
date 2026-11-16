@@ -21,6 +21,7 @@
 #include "esp_psram.h"
 #endif
 #include "diagnostic_log.h"
+#include "transfer_reserve.h"
 #if CONFIG_MUSE_POWER_TEST
 #include "muse_power_test.h"
 #endif
@@ -79,6 +80,10 @@ void app_main(void) {
     pipeline_bench_main();
     return;
 #endif
+    /* museStopWatch dev.20: arm the transfer reserve (transfer_reserve.h)
+     * before Wi-Fi, the UI and the app start churning the heap: the block
+     * has to be taken while internal RAM is still unfragmented. */
+    transfer_reserve_init();
 #if CONFIG_MUSE_ENABLED
     muse_glue_start();
 #endif

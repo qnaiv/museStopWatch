@@ -285,7 +285,9 @@ int main(int argc, char **argv) {
     if (test == 0) {   /* boot: black before display on, M5GFX's brightness */
         panel_setup(NULL);
         expect("swreset init black c51=160 on ");
-        assert(draws == (LCD_RES + 7) / 8 && !s_lcd_off);
+        /* dev.20: the count follows the chunk's rows (8→4 in dev.20). */
+        int chunk_rows = LCD_CHUNK_BYTES / (LCD_RES * 2);
+        assert(draws == (LCD_RES + chunk_rows - 1) / chunk_rows && !s_lcd_off);
     } else if (test == 1) {   /* the usual rest: the UI dims and sleeps the panel, then pauses */
         set_brightness(80); panel_sleep(false);
         expect("c51=204 c11 wait120 ");

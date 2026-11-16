@@ -43,9 +43,13 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # PSRAM, so booting without it needn't be allowed.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # CONFIG_SPIRAM_IGNORE_NOTFOUND is not set
-# That forces Wi-Fi's TX buffers static, in internal RAM: 8, not 16, at 1.6 KB
-# each, which voice over the tunnel doesn't fill.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+# That forces Wi-Fi's TX buffers static, in internal RAM: 6, not 16, at 1.6 KB
+# each, which voice over the tunnel doesn't fill. museStopWatch dev.20
+# (Tier A): TX 8→6 here, and RX overridden to 6 below (sdkconfig.muse
+# sets 8 for every Muse board; this keeps the change to this board) —
+# about 6.4 KB of permanent internal RAM back between them.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 
 # As on the Waveshare 1.75C, the same chip and panel. Screen off on battery: the CPU drops to the crystal clock and light-sleeps
 # until a rim key or the M5PM1's click interrupt (GPIO12) wakes it, with the

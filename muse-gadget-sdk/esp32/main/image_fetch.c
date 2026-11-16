@@ -17,6 +17,7 @@
 #include "image_fetch.h"
 #include "led_status.h"
 #include "noise_control.h"
+#include "transfer_reserve.h"
 #include "sdkconfig.h"
 
 #if CONFIG_HOMEHUB_DISPLAY_COMMANDS
@@ -103,6 +104,14 @@ static const char *TAG = "link.image";
 #define RAW_ROWS            4
 #if !JPEG_PERIPHERAL
 // Work pool for the ROM JPEG decoder, the size its documentation asks for.
+// The pool is CPU-only scratch (input arrives through callbacks), so it
+// goes in PSRAM where there is some: one less plain-malloc churn in
+// internal RAM per decode (dev.20, rule R5).
+#if CONFIG_SPIRAM
+#define JPEG_POOL_CAPS      (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
+#define JPEG_POOL_CAPS      MALLOC_CAP_8BIT
+#endif
 #define JPEG_POOL_BYTES     3100
 // Largest block the decoder emits: a 16x16 MCU.
 #define JPEG_MCU_PIXELS     (16 * 16)
@@ -188,6 +197,26 @@ static void log_memory(const char *stage) {
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024),
              (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA) / 1024));
+}
+
+// museStopWatch dev.20: a start refusal names its sub-check and the heap
+// it saw in the returned message itself — "<prefix>: <sub-reason>; int
+// <free>K largest <largest>K, dma <free>K, <reserve state>" — because
+// the diagnostic log ring that dev.19's lines land in is not remotely
+// readable (dev20-design §2.2(a), rule R8). The prefix and the error
+// code are unchanged; only vm_file_start's refusals use this, and only
+// the s_busy holder can reach them, so one static buffer is enough.
+static char s_refuse_msg[160];
+
+static const char *refuse_message(const char *prefix, const char *sub_reason,
+                                  const char *reserve_state) {
+    snprintf(s_refuse_msg, sizeof(s_refuse_msg), "%s: %s; int %uK largest %uK, dma %uK, %s",
+             prefix, sub_reason,
+             (unsigned)(internal_free() / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(BYTE_CAPS) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
+             reserve_state);
+    return s_refuse_msg;
 }
 
 // Bound the next socket operation by the time left. False once it is up,
@@ -307,7 +336,7 @@ static UINT jpeg_out(JDEC *jd, void *bitmap, JRECT *rect) {
 }
 
 static const char *draw_jpeg(fetch_t *f, int *out_w, int *out_h, int *out_scale) {
-    void *pool = malloc(JPEG_POOL_BYTES);
+    void *pool = heap_caps_malloc(JPEG_POOL_BYTES, JPEG_POOL_CAPS);
     if (!pool) return "out of memory";
     const char *err = NULL;
     JDEC jd;
@@ -1142,6 +1171,8 @@ static void file_task(void *arg) {
         atomic_store(&s_busy, false);
         ff->stream_done(total, code, message ? message : "", f->user);
         free(ff);
+        // dev.20: hand the transfer reserve back (vm_file_start acquired it).
+        transfer_reserve_rearm(TRANSFER_RESERVE_INSTALL);
         vTaskDelete(NULL);
         return;
     }
@@ -1190,6 +1221,8 @@ static void file_task(void *arg) {
     atomic_store(&s_busy, false);
     ff->file_done(data, len, code, message ? message : "", f->user);
     free(ff);
+    // dev.20: hand the transfer reserve back (vm_file_start acquired it).
+    transfer_reserve_rearm(TRANSFER_RESERVE_INSTALL);
     vTaskDelete(NULL);
 }
 
@@ -1231,12 +1264,27 @@ static bool vm_file_start(const char *path, size_t max, image_fetch_file_cb done
         *message = "another download is still running";
         return false;
     }
+    // dev.20: acquire the transfer reserve before the gate (R3): freeing
+    // its block makes the gate pass by construction. Snapshot the state
+    // for the refusal suffix first — after a successful acquire it reads
+    // "reserve in use", which is not the diagnostic.
+    const char *reserve_state = transfer_reserve_state();
+    if (!transfer_reserve_acquire(TRANSFER_RESERVE_INSTALL)) {
+        // An OTA holds the reserve: the existing busy behaviour (§3.3
+        // mutual exclusion — the two never compete for the heap).
+        atomic_store(&s_busy, false);
+        *code = "busy";
+        *message = "another download is still running";
+        return false;
+    }
     if (!s_vm.lock && !(s_vm.lock = xSemaphoreCreateMutex())) {
         ESP_LOGE(TAG, "vm file download refused: lock allocation failed");
         log_memory("vm file download refused");
-        atomic_store(&s_busy, false);
         *code = "out_of_memory";
-        *message = "failed to allocate";
+        *message = refuse_message("failed to allocate", "lock allocation failed",
+                                  reserve_state);
+        transfer_reserve_rearm(TRANSFER_RESERVE_INSTALL);
+        atomic_store(&s_busy, false);
         return false;
     }
     file_fetch_t *ff = calloc(1, sizeof(*ff));
@@ -1266,14 +1314,18 @@ static bool vm_file_start(const char *path, size_t max, image_fetch_file_cb done
     if (!ok) {
         ESP_LOGE(TAG, "vm file download refused: %s", refused);
         log_memory("vm file download refused");
+        // Compose the suffixed message before the re-arm takes its
+        // 30 KiB back: the numbers must describe the refusal moment.
+        *code = "out_of_memory";
+        *message = refuse_message("failed to start the download", refused,
+                                  reserve_state);
         if (f) {
             free(f->body);
             free(f->url);
         }
         free(ff);
+        transfer_reserve_rearm(TRANSFER_RESERVE_INSTALL);
         atomic_store(&s_busy, false);
-        *code = "out_of_memory";
-        *message = "failed to start the download";
         return false;
     }
     return true;

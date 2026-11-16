@@ -16,6 +16,7 @@
 
 #include "app.h"
 #include "stack_monitor.h"
+#include "msw_stack.h"   /* museStopWatch dev.20: PSRAM stack for vm_auth_rfsh */
 
 #include <string.h>
 #include <stdlib.h>
@@ -1158,7 +1159,7 @@ static void vm_auth_refresh_task(void *arg) {
             ESP_LOGI(TAG, "skipping VM credential refresh; another operation is active");
             finish_vm_auth_refresh_task();
             stack_monitor_record(NULL);
-            vTaskDelete(NULL);
+            msw_task_delete_self();
             return;
         }
     }
@@ -1177,7 +1178,7 @@ static void vm_auth_refresh_task(void *arg) {
     }
     finish_vm_auth_refresh_task();
     stack_monitor_record(NULL);
-    vTaskDelete(NULL);
+    msw_task_delete_self();
 }
 
 static void schedule_vm_auth_refresh(void) {
@@ -1197,7 +1198,12 @@ static void schedule_vm_auth_refresh(void) {
     s_last_vm_auth_refresh_attempt_us = now;
     auth_lock_give();
 
-    if (xTaskCreate(vm_auth_refresh_task, "vm_auth_rfsh", 8192, NULL, 4, NULL) != pdPASS) {
+    // dev.20: the stack goes in PSRAM (msw_stack.h). Audited: the refresh
+    // path (VM list fetch + Noise reconnect) never maps flash or reads
+    // OTA state — the only esp_ota_get_state_partition in this file is
+    // app_run's boot-time arming, on the main task. The task therefore
+    // ends with msw_task_delete_self(), not vTaskDelete().
+    if (msw_task_create(vm_auth_refresh_task, "vm_auth_rfsh", 8192, NULL, 4, NULL) != pdPASS) {
         auth_lock_take();
         s_vm_auth_refresh_pending = false;
         auth_lock_give();

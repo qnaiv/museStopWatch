@@ -70,6 +70,7 @@ bool ota_installed_by_vibe_mode(void) {
 
 #if CONFIG_HOMEHUB_OTA_ENABLED
 #include "stack_monitor.h"
+#include "transfer_reserve.h"
 #include "config_store.h"
 #include "esp_ota_ops.h"
 #include <inttypes.h>
@@ -103,6 +104,21 @@ static void ota_log_memory(const char *stage) {
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024),
              (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA) / 1024));
+}
+
+// museStopWatch dev.20: the "could not start ota task" detail gains the
+// same diagnostics suffix as image_fetch's refusals (dev20-design
+// §2.2(a), rule R8): the exact current text as prefix, then the
+// sub-reason and the heap figures. Compose it before any re-arm: the
+// numbers must describe the refusal moment.
+static void ota_refusal_detail(char *out, size_t cap, const char *sub_reason,
+                               const char *reserve_state) {
+    snprintf(out, cap, "could not start ota task: %s; int %uK largest %uK, dma %uK, %s",
+             sub_reason,
+             (unsigned)(heap_caps_get_free_size(OTA_BYTE_CAPS) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(OTA_BYTE_CAPS) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
+             reserve_state);
 }
 
 #define OTA_HTTP_TIMEOUT_MS        30000
@@ -351,6 +367,9 @@ done:
     free(ctx->url);
     free(ctx);
     stack_monitor_record(NULL);
+    // dev.20: hand the transfer reserve back (ota_start acquired it).
+    // The success path reboots above and never reaches here.
+    transfer_reserve_rearm(TRANSFER_RESERVE_OTA);
     vTaskDelete(NULL);
 }
 
@@ -390,15 +409,41 @@ void ota_start(const char *url, bool force, ota_status_cb cb, void *user) {
         return;
     }
 #endif
-    // 8 KB stack: TLS handshake + flash writes during the OTA download.
-    if (xTaskCreate(ota_task, "ota", 16384, ctx, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "could not start OTA task");
+    // dev.20: acquire the transfer reserve (R3), shared with app.install:
+    // freeing its block leaves a contiguous 30,720 B for the OTA task's
+    // 16,384 B stack by construction. Snapshot the state for the refusal
+    // suffix first — after a successful acquire it reads "in use".
+    const char *reserve_state = transfer_reserve_state();
+    if (!transfer_reserve_acquire(TRANSFER_RESERVE_OTA)) {
+        // An install holds the reserve: mutual exclusion (§3.3) — the
+        // two never compete for the heap. A start refusal, suffixed.
+        ESP_LOGE(TAG, "could not start OTA task: transfer reserve held by an install");
         ota_log_memory("ota start refused");
+        char detail[160];
+        ota_refusal_detail(detail, sizeof(detail), "an install is in progress",
+                           reserve_state);
         free(ctx->url);
         free(ctx);
         if (cb) {
             ota_event_t ev = { .result = OTA_RESULT_FAILED,
-                               .detail = "could not start ota task" };
+                               .detail = detail };
+            cb(&ev, user);
+        }
+        return;
+    }
+    // 16,384 B stack: TLS handshake + flash writes during the OTA download.
+    if (xTaskCreate(ota_task, "ota", 16384, ctx, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "could not start OTA task");
+        ota_log_memory("ota start refused");
+        char detail[160];
+        ota_refusal_detail(detail, sizeof(detail), "task creation failed",
+                           reserve_state);
+        free(ctx->url);
+        free(ctx);
+        transfer_reserve_rearm(TRANSFER_RESERVE_OTA);
+        if (cb) {
+            ota_event_t ev = { .result = OTA_RESULT_FAILED,
+                               .detail = detail };
             cb(&ev, user);
         }
     }

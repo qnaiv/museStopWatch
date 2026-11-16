@@ -36,6 +36,7 @@
 #include "src/misc/lv_area_private.h"            /* lv_area_intersect, for the ring */
 
 #include "esp_app_desc.h"   /* museStopWatch dev.17: the history upload names its firmware */
+#include "msw_stack.h"      /* museStopWatch dev.20: PSRAM task stacks (dash, batthist) */
 #include "muse_battery.h"   /* museStopWatch dev.17: the battery history */
 #include "muse_ble.h"
 #include "muse_board.h"
@@ -3036,7 +3037,7 @@ static void build_dash(lv_obj_t *tile)
         s_dash_json[0] = '\0';   /* no edition yet, whatever else failed */
     }
     if (s_dash_json && s_dash_new && s_dash_env && s_dash_scratch && s_dash_go && s_dash_done) {
-        if (xTaskCreate(dash_fetch_task, "dash", 8192, NULL, tskIDLE_PRIORITY + 2, &s_dash_task) != pdPASS) {
+        if (msw_task_create(dash_fetch_task, "dash", 8192, NULL, tskIDLE_PRIORITY + 2, &s_dash_task) != pdPASS) {
             s_dash_task = NULL;
         }
     }
@@ -3277,8 +3278,8 @@ void muse_batt_hist_upload_request(void)
         s_batt_hist_go = xSemaphoreCreateBinary();
         s_batt_hist_done = xSemaphoreCreateBinary();
         if (!s_batt_hist_text || !s_batt_hist_env || !s_batt_hist_go || !s_batt_hist_done ||
-            xTaskCreate(batt_hist_task, "batthist", 8192, NULL, tskIDLE_PRIORITY + 2,
-                        &s_batt_hist_task) != pdPASS) {
+            msw_task_create(batt_hist_task, "batthist", 8192, NULL, tskIDLE_PRIORITY + 2,
+                            &s_batt_hist_task) != pdPASS) {
             s_batt_hist_task = NULL;
             return;
         }

@@ -141,6 +141,12 @@ static int fake_task_create(void (*fn)(void *), void *arg) {
     ((void)(name), (void)(handle), fake_task_create((fn), (arg)))
 static void vTaskDelay(uint32_t ticks) { (void)ticks; }
 static void vTaskDelete(void *task) { (void)task; }
+/* dev.20: app.c creates vm_auth_rfsh with msw_task_create (PSRAM stack)
+ * and ends it with msw_task_delete_self; on the host both are the fakes
+ * above. */
+#define msw_task_create(fn, name, stack, arg, prio, handle) \
+    ((void)(name), (void)(handle), fake_task_create((fn), (arg)))
+static void msw_task_delete_self(void) { vTaskDelete(NULL); }
 static void stack_monitor_record(void *state) { (void)state; }
 
 static int64_t s_now = 1000000;

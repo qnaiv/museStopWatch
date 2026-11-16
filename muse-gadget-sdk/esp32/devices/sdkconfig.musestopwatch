@@ -36,3 +36,10 @@ CONFIG_MUSE_HATCH_COMPACT_BUFFERS=y
 # museStopWatch: firmware updates only from our own Releases (signed with our
 # key); any other URL, the official SDK's included, is refused even with force.
 CONFIG_HOMEHUB_OTA_URL_PREFIX="https://github.com/qnaiv/museStopWatch/releases/download/"
+
+# museStopWatch dev.20 (Tier A): LwIP receive mailboxes 64→32 — TCP, UDP
+# and the tcpip thread's own (sdkconfig.defaults sets 64). The queues
+# hold pointers, and this board's traffic never fills 32.
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32

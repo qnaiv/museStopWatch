@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "rom/tjpgd.h"
 
 #include "msw_app_priv.h"
@@ -64,7 +65,10 @@ static bool prepare(JDEC *jd, jpg_t *j, void **pool, const void *jpg, int len, c
     j->src = jpg;
     j->len = (size_t)len;
     j->at = 0;
-    *pool = malloc(POOL_BYTES);
+    /* museStopWatch dev.20: the work pool is CPU-only scratch, so it goes
+     * in PSRAM (as the rest of this component allocates): a plain malloc
+     * here churned 3,100 B of internal RAM on every decode (rule R5). */
+    *pool = heap_caps_malloc(POOL_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return *pool && jd_prepare(jd, jpg_in, *pool, POOL_BYTES, j) == JDR_OK && jd->width && jd->height
            && jd->width <= MAX_SIDE && jd->height <= MAX_SIDE;
 }

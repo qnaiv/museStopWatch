@@ -32,6 +32,7 @@ set(GADGET_SRCS
     "vm_api.c"
     "diagnostic_log.c"
     "stack_monitor.c"
+    "transfer_reserve.c"
     "bug_report.c"
     "ota.c"
     "image_fetch.c"

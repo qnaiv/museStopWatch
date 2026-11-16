@@ -89,7 +89,11 @@ static const char *TAG = "board";
 #define LCD_D2 GPIO_NUM_46
 #define LCD_D3 GPIO_NUM_45
 #define DRAW_BUF_LINES 118         /* four bands to the screen (muse_lcd_bands.h) */
-#define LCD_CHUNK_BYTES (LCD_RES * 8 * 2)
+/* museStopWatch dev.20: 4 rows per DMA chunk, not 8 (Tier A): the two
+ * chunks are permanent internal DMA RAM, so this halves their 14,912 B
+ * to 7,456 B. muse_lcd_bands derives its row count from the byte size,
+ * so nothing else changes; 4 stays even, as the CO5300 requires. */
+#define LCD_CHUNK_BYTES (LCD_RES * 4 * 2)
 #define LCD_LEVEL_BOOT 0xA0        /* M5GFX's brightness, until the UI sets its own */
 #define LCD_POWER_UP_MS 20         /* 3V3_L3B up before the reset is let go; M5GFX waits 10 */
 #define LCD_RESET_MS 120           /* the panel's wake from reset, as init() waits */
@@ -573,8 +577,10 @@ static void panel_setup(void *arg)
     esp_lcd_panel_init(s_panel);
     uint8_t *black = heap_caps_calloc(1, LCD_CHUNK_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (black) {
-        for (int y = 0; y < LCD_RES; y += 8) {
-            esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_RES, y + 8 < LCD_RES ? y + 8 : LCD_RES, black);
+        const int rows = LCD_CHUNK_BYTES / (LCD_RES * 2);   /* the chunk's rows */
+        for (int y = 0; y < LCD_RES; y += rows) {
+            esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_RES,
+                                      y + rows < LCD_RES ? y + rows : LCD_RES, black);
         }
     }
     lcd_cmd(0x51, &s_lcd_level, 1);             /* waits for the queued draws first */

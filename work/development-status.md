@@ -2066,3 +2066,214 @@ muse_diy_stopwatch/miniapp/msw_app_launcher.c、version.txt。
 - 実機未検証（OTA はユーザーの指示があるときだけ）: 次回ストール時に
   ログへ「vm file download refused: <サブチェック名>」と int/dma
   数値が出ること。
+
+## 2026-11-16 — dev.20 設計メモ（設計のみ・未実装）
+
+- work/dev20-design-2026-11-16.md を作成。実装・push はしていない。
+  ユーザーの設計承認待ち。
+- 内容: (1) アプリ実行後に app.install が拒否され続ける件の保持調査。
+  ミニアプリ runtime 内に「実行ごとに内部 RAM を残す確保」は見つからず
+  （アプリヒープ・タスクスタック・ELF・描画・LVGL はすべて PSRAM で
+  終了時に解放）。最有力は内部ヒープ断片化による最大ブロック
+  （6,144 B）不足と、ゲート keep ≈29.9 KiB に対する余裕の薄さの複合。
+  アプリ経路の内部 RAM churn として TJpgDec プール 3,100 B（malloc、
+  msw_app_jpeg.c）を特定し、PSRAM 化を hygiene として提案。構造対策
+  （vm_file タスクのスタック事前確保）は診断数値が出てから判断する
+  段階案。(2) dev.19 の拒否ログをリモートで読む方法の設計。
+  bug.report は Kconfig の説明どおり「登録に載せない」のが上流の
+  意図的な設計（サポート用 PII を含む私的経路）のため不採用とし、
+  拒否エラーメッセージ自体にサブ理由と int/dma/largest 数値を
+  接尾する案 (a) を推奨。エラーコードと成功経路は不変、文言の
+  接尾だけが dev.19 の「文言不変」からの意図的な例外で要承認。
+- F3（ゲート予算の再導出）は引き続き未承認・未実施。F2 は不採用のまま。
+
+## 2026-11-16 — dev.20 メモリ予算・一般実装ルール（設計のみ・未実装）
+
+- work/dev20-memory-rules-2026-11-16.md を作成。実装・push はしていない。
+  ユーザーの設計承認待ち（dev20-design-2026-11-16.md の段階案を置き換える
+  包括版。ユーザーの指示: M5 StopWatch の実仕様に基づき、ルールは全般化し、
+  インストール/OTA が失敗しないよう計算すること）。
+- 要点: ESP32-S3 の内部 SRAM 512KiB に対し実測の空きは 58〜74KiB（悪化時
+  40KiB・最大塊 10.7KiB）。install の gate keep 29,850B / OTA の 16,384B
+  連続塊という無保証の要求と衝突し、悪化時 OTA は約 6.1KiB の塊不足、
+  install は音声ターン中に約 4〜6KiB 不足（実測アンカーから計算）。
+- 対策の中核: 起動時に 30,720B（DMA|INTERNAL）を確保して保持する
+  「transfer reserve」を install と OTA で共有し、開始時に解放して
+  ゲートを構造的に満たす（noise_control の reserve_stack パターンの一般化）。
+  あわせて dash/batthist のスタック PSRAM 化（−16KiB）で相殺。
+  一般ルール R1〜R10 とマージ前チェックリストを定義。F3（ゲート予算の
+  再導出）は reserve の下では不要として superseded を提案。
+- 承認待ちの判断: Q1 reserve 方式、Q2 TJpgDec の PSRAM 化を image_fetch
+  側にも拡張、Q3 F3 終了と OTA への診断接尾。
+- 需要側の最適化候補を別メモに切り出し:
+  work/dev20-optimization-candidates-2026-11-16.md(設計のみ)。
+  Tier A(WiFi 静的バッファ 8→6、LCD DMA チャンク 8→4 行、lwIP
+  mbox 半減)で新規の恒常削減 ≈13.9KiB — reserve の純コスト
+  ≈14.3KiB をほぼ相殺。Tier B まで入れると ≈26.7KiB。
+  reserve は keep=29,850 が下限で縮小不可。推奨は reserve +
+  Tier A の併用(最適化だけでは最悪ケースを bound できない)。
+
+## 2026-11-16 — 0.3.0-dev.20
+
+### transfer reserve + Tier A 最適化（設計2メモの実装）
+
+- 背景: work/dev20-memory-rules-2026-11-16.md（§3.3 予約枠・§4
+  ルール R1〜R10・§5 変更リスト）と
+  work/dev20-optimization-candidates-2026-11-16.md（Tier A）。
+  ユーザー承認済み（2026-11-16「推奨どおり（予約枠＋Tier A）で
+  実装して」、Q1〜Q4 はすべて推奨どおり）。Tier B は未承認のため
+  未実施（I2S DMA サイズと WiFi 静的バッファ 6 未満には触れていない）。
+- 変更:
+  1. **main/transfer_reserve.{c,h} 新規**（ルール R3）: 起動時に
+     30,720 B を MALLOC_CAP_DMA|INTERNAL|8BIT で確保して保持する
+     「transfer reserve」。noise_control.cpp の reserve_stack()
+     パターンの一般化。API は acquire（保持ブロックを解放し保持者を
+     記録。保持中は busy として失敗）/ rearm（再確保。単一ブロックが
+     取れなければ 17 KiB + 残りの2片フォールバック。失敗は診断用に
+     保持）/ state 照会。初期化は main.c の app_main で
+     diagnostic_log_init の直後・muse_glue_start()/app_run() の前
+     （Wi-Fi/UI がヒープを断片化させる前の一番早いアプリ側地点）。
+     PSRAM のないビルドでは無効（acquire は常に成功し何も解放
+     しない＝従来挙動のまま）。
+  2. **main/image_fetch.c vm_file_start**: ゲート前に reserve を
+     acquire（解放→ゲート→タスク生成の順）。file_task は両方の
+     終了分岐（sink / file）で rearm。admission 後の開始失敗経路は
+     すべて return 前に rearm。OTA が reserve を保持中は既存の busy
+     挙動（コード "busy"、§3.3 の相互排他）。ゲート計算・コード・
+     成功経路は不変。main/CMakeLists.txt に transfer_reserve.c を追加。
+  3. **main/ota.c ota_start**: xTaskCreate(ota_task, 16384) の直前に
+     同じ reserve を acquire。生成失敗時と ota_task の done 経路
+     （成功時は再起動するので到達しない）で rearm。install が保持中
+     は開始拒否として "could not start ota task" + サフィックスで
+     通知。ついでに陳腐化していた「8 KB stack」コメントを実値
+     16,384 B に修正（挙動不変）。
+  4. **TJpgDec プール → PSRAM**（R5）: components/muse_diy_stopwatch/
+     miniapp/msw_app_jpeg.c（malloc → heap_caps_malloc SPIRAM）と
+     main/image_fetch.c の draw_jpeg（JPEG_POOL_CAPS、PSRAM のない
+     ビルドでは従来どおり内部）。どちらも CPU 専用作業領域で DMA
+     なし。
+  5. **components/muse/muse_ui.c dash / batthist のスタック →
+     PSRAM**: xTaskCreate → msw_task_create（各 8,192 B、計
+     −16,384 B 恒常）。事前監査: 両タスクとその呼び出し先
+     （muse_link_req_*、cJSON、muse_battery_hist_* の NVS 書き込み）
+     に esp_partition_mmap / esp_ota_get_state_partition は無し
+     （muse_ui.c 全体にも無い）。両タスクとも常駐で自己削除しない
+     ため vTaskDeleteWithCaps の注意点は該当しない。
+  6. **診断サフィックス**（dev20-design §2.2(a)、R8）: vm_file_start
+     の拒否（"failed to start the download" と "failed to allocate"）
+     と ota_start の "could not start ota task" は従来文言を接頭辞
+     として保持し、「: <サブ理由>; int <free>K largest <largest>K,
+     dma <free>K, <reserve 状態>」を接尾。reserve 状態は admission
+     前のスナップショット（acquire 後は "in use" になり診断に
+     ならないため）。エラーコード不変、成功経路の文言はバイト
+     単位で不変、dev.19 の ESP_LOGE/log_memory 行は存続。
+     tests/link_ota_harness.c に transfer_reserve のホスト用
+     スタブを追加（ota.c をリンクするハーネスのため）。
+  7. **Tier A**:
+     - Wi-Fi 静的 RX 8→6 / TX 8→6: TX は設定元の
+       devices/sdkconfig.muse-m5stack-stopwatch を 8→6 に編集。
+       RX は sdkconfig.muse（全 Muse ボード共通）の 8 をこの
+       ボード用に同ファイルで 6 に上書き（チェーン後勝ち。共通
+       ファイル側は他ボードへの影響を避けて未変更）。
+     - LCD DMA チャンク 8 行→4 行: components/muse/boards/
+       board_m5stack_stopwatch.c の LCD_CHUNK_ROWS（2チャンクで
+       14,912 B → 7,456 B）。muse_lcd_bands は行数をバイト数から
+       導出するため追随変更なし。panel_setup の黒塗りループは
+       チャンク行数で回すよう修正（従来は 8 行固定でバッファ
+       オーバーランになるところ）。
+     - LwIP recvmbox 64→32 ×3（TCP/UDP/TCPIP）:
+       devices/sdkconfig.musestopwatch で上書き（sdkconfig.defaults
+       の 64 をこの製品用に）。cmake/validate_config.cmake の
+       recvmbox 条件は C5 例外分岐内のみで本ボードには無関係
+       （SND_BUF/WND は 16,384 のまま）。
+     - チャットセッションのハンドシェイクバッファ → PSRAM:
+       components/muse/muse_chat_session.cpp の要求バッファ
+       （~0.6–2 KiB）・応答ヘッダバッファ（4,096 B）・トークン
+       バッファ（~1 KiB）を heap_caps_malloc(MUSE_BIG_CAPS) に
+       （PSRAM のないボードでは内部にフォールバックする既存マクロ）。
+     - vm_auth_rfsh スタック → PSRAM: main/app.c の生成を
+       msw_task_create にし、2つの終了地点を msw_task_delete_self()
+       に変更。事前監査:  credentials 更新経路（vm_api.c /
+       noise_control.cpp / wifi_mgr.c / config_store.c）に
+       esp_partition_mmap / esp_ota_get_state_partition は無し。
+       app.c 内の唯一の esp_ota_get_state_partition は app_run の
+       起動時アーミング（main タスク上）で本タスクとは無関係。
+- **F3（ゲート予算の再導出）は R3 / transfer reserve により
+  superseded として終了**（メモ §5 の提案どおり、ユーザー承認済み）。
+  ゲートは R7 の tripwire として存続し、keep は reserve の
+  サイジング入力になった。
+- 検証: ホストテスト全スイート（952 件、unittest discover）を
+  dev.19 のツリー（git worktree で HEAD を切り離して実行）と
+  変更後のツリーで実行し、失敗・エラー一覧が完全一致
+  （failures=15 / errors=35 / skipped=10、いずれも既存分のみ。
+  内訳は従来どおり test_link_image_fetch 2件・test_link_ota 1件・
+  test_muse_full_reply 4件・test_stopwatch_power 1件ほかの既存失敗と
+  ハーネス環境エラー）。新規失敗ゼロ。過程で見つけた追随修正2件:
+  test_stopwatch_power の oled テストが旧チャンク形状（8行）を
+  前提にしていたため描画回数の期待値をチャンク行数から導出するよう
+  変更（テスト側の前提更新であり挙動の期待は不変）、
+  test_link_token_refusal のハーネスに msw_task_create /
+  msw_task_delete_self のホスト用フェイクを追加。
+- 実機未検証（OTA はユーザーの別途指示があるときだけ）:
+  reserve の確保・解放・再確保の実挙動、Tier A の効果と副作用
+  （Wi-Fi バッファ削減時のスループット、LCD チャンク半減時の
+  描画、mbox 半減時の受信）、そして受け入れテスト
+  **「ミニアプリを実行 → 終了 → app.install」**（今日失敗する
+  まさにその手順）が dev.20 適用後に通るかは未確認。
+
+### 内部 RAM 予算表（R10・常設）
+
+work/dev20-memory-rules-2026-11-16.md §2 の監査表をここに常設する
+（R10: 新しい内部 RAM 恒常消費はこの表に同じコミットで追記し、
+最悪ケース合計で ≥8 KiB の余裕を保つ）。数値は dev.19 時点の監査値。
+dev.20 での変更点は表の直後にまとめる。
+
+#### 2.1 恒常（Permanent）
+
+| Consumer | Internal size | Class | Source |
+|---|---|---|---|
+| Wi-Fi static TX buffers | 8 × ~1.6 KiB ≈ **13,100** | P | Overlay comment ("8, not 16, at 1.6 KB each"); `CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8` |
+| Wi-Fi static RX buffers | 8 × ~1.6 KiB ≈ **13,100** | P | `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8` (sdkconfig.muse); dynamic RX (32) tries PSRAM first (`SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`) |
+| Wi-Fi / LwIP / BLE IDF task stacks + queues | ≈ **12,000** (est.) | P | IDF defaults (Wi-Fi task 3584, tcpip task 3072, NimBLE host 4096, + TCBs); not overridden in the chain. NimBLE pools are PSRAM (`BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`) |
+| LCD DMA band chunks | 2 × 7,456 = **14,912** | P | `LCD_CHUNK_BYTES = 466×8×2` (board_m5stack_stopwatch.c:92); heap_caps DMA\|INTERNAL (muse_lcd_bands.c:360-361). Must stay internal (PSRAM DMA limits, §1) |
+| I2S DMA (ES8311 duplex) | 2 × 6 desc × 240 frames × 4 B = **11,520** + descriptors | P | `I2S_CHANNEL_DEFAULT_CONFIG` (dma_desc_num 6, dma_frame_num 240, IDF defaults), stereo 16-bit (board_m5stack_stopwatch.c:959-973) |
+| Main task stack | **8,192** | P | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192`; the main loop (heartbeat) runs on it |
+| Mini-app service task stack | **6,144** | P | Plain `xTaskCreatePinnedToCore` at subsystem init (msw_app_core.c:1879). Legitimately internal: it writes app packages to flash |
+| Dashboard fetch task stack ("dash") | **8,192** | P (created when the dashboard is first built, never deleted) | Plain `xTaskCreate` (muse_ui.c:3039). **Rule violation — see §5** |
+| Battery-history task stack ("batthist") | **8,192** | P (created on first due upload, never deleted) | Plain `xTaskCreate` (muse_ui.c:3280). **Rule violation — see §5** |
+| sanoTTS static internal | ≈ **4,900** | P | development-status.md:179 ("TTS で静的に約 4.9KB 増えた"); its ~120 KiB arena is PSRAM |
+| LVGL | ~0 heap (PSRAM allocator, muse_lv_mem.c); adapter task stack ≤8,192 worst case | P | muse_lv_mem.c (`LV_CAPS = SPIRAM`); adapter stack caps not verified in this audit — budgeted at 8 KiB worst case |
+
+#### 2.2 操作ごとの一時消費（Per-operation transients）
+
+| Consumer | Internal size | Class | Source |
+|---|---|---|---|
+| **app.install (vm_file)** | gate keep **29,850** must be free (both heaps) + **6,144** contiguous stack + TCB | T | image_fetch.c:52,72,106; noise_tunnel_internal.h:73; investigation §(a) |
+| **device.ota** | **16,384** contiguous stack + TCB (≈16.8 KiB block) | T | ota.c:394 (comment says "8 KB stack", code creates 16384) |
+| Voice turn (chat session) | request buffer ~0.6–2 KiB + header buffer **4,096** + token ~1 KiB, all plain malloc → internal (≤4 KiB rule) ≈ **6–8 KiB** | T | muse_chat_session.cpp:612,633,870. Reply text/MP3/turn state: PSRAM |
+| Image draw fetch (display.draw_file / voice.play fetch) | stack 6,144 (HTTP) / 8,192 (HTTPS) + TJpgDec pool 3,100 | T | image_fetch.c:51-52,310 |
+| TJpgDec work pool, mini-app JPEG | **3,100** per decode, plain malloc → internal; sanpo decodes 7+ per run | T (recurring churn) | msw_app_jpeg.c:67; dev20-design §1.2 |
+| Store put/get copies | ≤ **4,096** per call | T | msw_app_api.c:750,769. Must stay internal (flash-writing service task) |
+| Noise TX | ~0 (slots PSRAM, noise_tunnel.cpp:143); the 16 KiB `NOISE_TX_DMA_RESERVE_BYTES` is a *margin check* on total DMA free, not an allocation | — | noise_tunnel_internal.h:73 |
+
+#### 2.3 ミニアプリ実行中（While a mini app runs）
+
+≈ **0 by design**: app task stack 16,384 PSRAM (WithCaps), app heap PSRAM
+with exit sweep, ELF segments PSRAM, LVGL screen PSRAM, sound/mic rings
+static PSRAM (dev20-design §1.1 audit). The only internal effects of an
+app run are the §2.2 transients it triggers (JPEG pools, store copies)
+and the fragmentation they leave behind.
+
+**dev.20 での変更（上表からの差分）**:
+- transfer reserve **+30,720**（P、保持中のみ。transfer 中は解放される）
+- dash / batthist スタック PSRAM 化 **−16,384**（P、上表の "Rule
+  violation" 2行は解消）
+- Wi-Fi 静的 TX/RX 8→6 で **≈ −6,400**（P、2行とも 6 × ~1.6 KiB ≈ 9,830 に）
+- LCD DMA チャンク 8→4 行で **−7,456**（P、2 × 3,728 = 7,456 に）
+- LwIP recvmbox 64→32 ×3 で **≈ −500**（P、2.1 の stacks + queues 行内）
+- vm_auth_rfsh スタック PSRAM 化 **−8,192**（T、表外だった一時タスク）
+- チャットセッションのハンドシェイクバッファ PSRAM 化（2.2 の
+  Voice turn 行 ≈6–8 KiB は再接続時の一時消費として解消）
+- TJpgDec プール 2箇所 PSRAM 化（2.2 の該当2行は解消）
+- app.install / device.ota は reserve が資金源になり、ゲートは
+  tripwire として存続（R7）

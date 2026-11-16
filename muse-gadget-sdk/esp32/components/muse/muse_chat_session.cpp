@@ -76,6 +76,7 @@ extern "C" {
 #include "minimp3.h"
 #include "muse_account_api.h"
 #include "muse_link.h"
+#include "muse_mem.h"
 #include "muse_settings.h"
 #include "muse_state.h"
 #include "muse_text.h"
@@ -609,7 +610,10 @@ static int ws_upgrade(esp_tls_t *tls, const char *vm_id, const char *token)
     }
 #endif
     size_t cap = 512 + strlen(id) + strlen(app) + strlen(token) + strlen(s_host);
-    char *req = static_cast<char *>(malloc(cap));
+    /* dev.20: handshake scratch goes in PSRAM where there is some
+     * (MUSE_BIG_CAPS) — plain malloc put ~6–8 KiB per (re)connect in
+     * internal RAM (rule R5). CPU-only buffers; esp_tls copies them. */
+    char *req = static_cast<char *>(heap_caps_malloc(cap, MUSE_BIG_CAPS));
     if (!req) {
         return 0;
     }
@@ -630,7 +634,7 @@ static int ws_upgrade(esp_tls_t *tls, const char *vm_id, const char *token)
     }
     /* Edge error responses carry a ~1.4 KB Proxy-Status header. */
     const size_t kCap = 4096;
-    char *hdr = static_cast<char *>(malloc(kCap));
+    char *hdr = static_cast<char *>(heap_caps_malloc(kCap, MUSE_BIG_CAPS));
     if (!hdr) {
         return 0;
     }
@@ -867,7 +871,7 @@ static bool resolve_vm(char *err, size_t err_cap)
         strlcpy(err, muse_link_hatch_linked() ? "Can't reach Muse's server" : "Not paired", err_cap);
         return false;
     }
-    char *token = static_cast<char *>(malloc(MUSE_TOKEN_MAX + 1));
+    char *token = static_cast<char *>(heap_caps_malloc(MUSE_TOKEN_MAX + 1, MUSE_BIG_CAPS));
     if (!token) {
         strlcpy(err, "Out of memory", err_cap);
         return false;

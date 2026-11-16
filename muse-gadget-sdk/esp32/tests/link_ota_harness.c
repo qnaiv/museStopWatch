@@ -20,7 +20,23 @@
 
 #include "sdkconfig.h"
 #include "ota.h"
+#include "transfer_reserve.h"
 #include "esp_app_desc.h"
+
+/* dev.20: the transfer reserve is a host stand-in — admission always
+ * succeeds, re-arming does nothing. */
+bool transfer_reserve_acquire(transfer_reserve_holder_t who) {
+    (void)who;
+    return true;
+}
+
+void transfer_reserve_rearm(transfer_reserve_holder_t who) {
+    (void)who;
+}
+
+const char *transfer_reserve_state(void) {
+    return "reserve held";
+}
 
 static esp_app_desc_t running = { .version = "999.0.0" };
 static int callbacks;
