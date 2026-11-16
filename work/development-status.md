@@ -1952,3 +1952,79 @@ muse_diy_stopwatch/miniapp/msw_app_launcher.c、version.txt。
   集計行、workspace/battery_history.json が実際に書き出されること、
   app.store_put した ToDo が次回起動時に表示されること、NVS 永続化と
   スリープ中の記録間隔。
+
+## 2026-11-16 — 0.3.0-dev.18
+
+ユーザー依頼2件: (1) 応答待ちのままになったとき画面タップで
+キャンセルして通常の文字盤に戻れるように、(2) 英語のみのレスポンスで
+文字が画面からはみ出す問題の修正。
+
+### dev.18-1: 応答待ち・録音中のタップキャンセル
+
+- muse_voice.h / muse_voice.c: muse_voice_tap_cancel() を新設。
+  UI タスクから atomic_bool s_tap_cancel を立てるだけの関数で、
+  音声タスク側のループが消費する。
+  - hatch_reply() の待機ループ: PTT 割り込みチェックの直後で
+    フラグを消費し、再生開始前（!speaking）なら
+    muse_hatch_turn_cancel() + go_idle("") で文字盤へ戻る。
+    再生が始まってからはタップでは止めない（消費だけする。
+    割り込みは従来どおりボタン）。
+  - record() のループ: フラグが立っていたら turn_cancel して
+    ノートを送らずに終了（why は空 = 呼び出し側は通常キャンセル
+    として go_idle("") する）。record() 入口でフラグをクリアする
+    ので、押し直しに古いタップは持ち越さない。finish_note の
+    "SENDING VOICE NOTE" 表示中にタップした場合はフラグが残り、
+    hatch_reply の初回ループで即キャンセルになる。
+  - 既知の制限: dev.6 の「遅い返信」切り離し後（モードが IDLE に
+    戻っている間）はタップキャンセルの対象外。遅れて届いた返信が
+    hatch_reply(incoming) で再生される間はキャンセルできる。
+- muse_ui.c: on_caption_clicked と on_canvas_clicked に
+  StopWatch 限定で分岐追加。モードが THINKING / LISTENING のとき
+  だけ muse_voice_tap_cancel() を呼び、それ以外は従来動作のまま
+  （IDLE の字幕クリア、みゃおっちケアパネル、make_happy は不変）。
+  承認ボタンは別オブジェクトなので競合しない。
+
+### dev.18-2: 英語レスポンスのはみ出し
+
+- 根本原因（コードと LVGL 9.5.0 実物で裏取り）: ページャ
+  （muse_chat_text.c）とフォント実測は正しかった。unscii_16 は
+  全グリフ adv_w=256（=16px）の等幅で、ページ行は HEARD 18列
+  （288px）/ READ 13列（208px）に収まる。LVGL の WRAP は
+  ラベル幅を超える行を描かない。
+  問題はフル表示（dev.5）での文字寄せ: 返信ラベルはレイアウトの
+  text_align を引き継ぎ、READ レイアウト（スピーカーOFF時）は
+  LV_TEXT_ALIGN_LEFT。READ の左寄せは幅208pxの中央配置ボックス
+  （x=129..337）前提の設計だが、フル表示ではラベルが x=16..450 に
+  広がるのに左寄せのままになる。丸画面の可視弦は上端 y=56 で
+  約303px（x≈81..385）しかなく、上部の行ほど行頭が画面の見える
+  範囲の外から始まり、最初の数文字が画面からはみ出して欠ける。
+  HEARD（中央寄せ）と字幕ラベル（中央寄せ）は弦の内側に収まる
+  ため出ない。
+- 修正（muse_ui.c のフル表示ブロックのみ）: フル表示に入るとき
+  返信ラベルの text_align を LV_TEXT_ALIGN_CENTER にする。ページ行は
+  最大でも288pxで、ラベルが覆う全行で弦の内側に収まることを
+  幾何で確認済み。フル表示を抜けるときは、表示中のレイアウトの
+  align を戻す（ボックス表示で左寄せに戻る）。字幕ラベル側・
+  ページャ・フォントには手を入れていない。
+- なお dev.13 のコメントにある「unscii の 'M' は 8px」は LVGL
+  9.5.0 の実フォントデータでは 16px が正しい（全グリフ 256）。
+  caption_cjk_cw() は結果として同じ 16 を返すので実害はないが、
+  コメントの記述は事実と異なる。今回は触っていない。
+
+### 検証
+
+- ホストテスト: tests.test_muse_caption_wrap /
+  tests.test_muse_voice_note_backlog / tests.test_muse_turn_sleep /
+  tests.test_watcher_sleep_contract / tests.test_muse_battery は OK。
+  tests.test_muse_full_reply 4件・tests.test_stopwatch_power 1件・
+  tests.test_muse_voice_note / tests.test_muse_caption_hint /
+  tests.test_stopwatch_controls のエラーは、stash で変更前後を
+  比較し変更前でも同一に再現する既存問題であることを確認済み
+  （dev.17 の記録にあるものと同一。新規失敗ゼロ）。
+- simulator はこのフォークではビルド不可（muse_ui.c 等が
+  esp_random.h / esp_attr.h / msw_text.h を要求し、sim の compat に
+  無い。変更前から同一）。実機確認は OTA 後にユーザーが行う。
+- 実機未検証（OTA はユーザーの指示があるときだけ）:
+  応答待ちタップで文字盤に戻ること、録音中タップでノートが
+  送られないこと、スピーカーOFF（READ）での英語返信がフル表示で
+  行頭欠けなく読めること。

@@ -840,6 +840,13 @@ static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* dev.18: as on the caption, a tap on Muse while a reply is waited on
+     * (or a note is recording) cancels the wait instead of cheering. */
+    muse_mode_t mode = muse_state_mode(NULL);
+    if (mode == MUSE_MODE_THINKING || mode == MUSE_MODE_LISTENING) {
+        muse_voice_tap_cancel();
+        return;
+    }
     /* dev.14: a tap on the avatar opens its care panel — but only while
      * the face is the avatar's alone. While a reply is up (the caption,
      * the read layout, a kept full reply, a question's buttons) the tap
@@ -862,6 +869,15 @@ static void on_canvas_clicked(lv_event_t *e)
 static void on_caption_clicked(lv_event_t *e)
 {
     (void)e;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* dev.18: tapped while Muse's reply is being waited on (or a note is
+     * still being recorded): cancel the wait, back to the plain face. */
+    muse_mode_t mode = muse_state_mode(NULL);
+    if (mode == MUSE_MODE_THINKING || mode == MUSE_MODE_LISTENING) {
+        muse_voice_tap_cancel();
+        return;
+    }
+#endif
     if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
         muse_state_set_caption("%s", "");
     }
@@ -4284,6 +4300,11 @@ static void update_status(muse_mode_t mode, float now)
                     lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, s_cap_y);
                     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
                 }
+                if (s_full_lbl == s_reply_lbl && s_answer >= 0) {
+                    /* dev.18: give the answer box its layout alignment back
+                     * (the full display centres the reply, below). */
+                    lv_obj_set_style_text_align(s_reply_lbl, s_answers[s_answer].align, 0);
+                }
                 lv_obj_remove_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_remove_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
                 if (answer < 0) {
@@ -4297,6 +4318,18 @@ static void update_status(muse_mode_t mode, float now)
                 lv_obj_set_size(lbl, s_w - 32, s_h - 200);
                 lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 56);
                 lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
+                /* dev.18: the read layout's pages are left-aligned for its
+                 * narrow centred box (208 px at x=129..337, inside the
+                 * circle at every row). Up here the label spans x=16..450,
+                 * but the round screen's visible chord at the top rows is
+                 * only ~300 px wide (x≈81..385 at y=56), so a left-aligned
+                 * line starts off the visible screen and its first
+                 * characters are lost. Centred, a paged line — never wider
+                 * than its layout's box, 288 px at most — stays inside the
+                 * chord at every row this label covers. */
+                if (lbl == s_reply_lbl) {
+                    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+                }
                 lv_obj_add_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_add_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN);
                 move_muse(face_px() * 2 / 5, 168);

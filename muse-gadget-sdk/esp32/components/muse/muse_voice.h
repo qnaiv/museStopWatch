@@ -63,6 +63,12 @@ float muse_voice_monitor_db(void);
 /* Plays a short chirp at the current volume (when idle). */
 void muse_voice_request_chirp(void);
 
+/* dev.18: the face was tapped while a voice note is being recorded or its
+ * reply is being waited on: abandon the turn and return to the idle face.
+ * A tap once the reply is speaking is ignored (the talk button still
+ * interrupts speech). */
+void muse_voice_tap_cancel(void);
+
 /* Runs muse_audio_loopback_test() at the current volume (when idle); results go to the log. */
 void muse_voice_request_loopback(void);
 

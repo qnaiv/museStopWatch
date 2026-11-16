@@ -369,10 +369,21 @@ static void take_pre(rec_stats_t *st, size_t chunks)
  * kept note to fall back on (why says what failed). There is no start chirp:
  * anything played now would land on top of the first words.
  */
+/* dev.18: set by muse_voice_tap_cancel() (called from the UI task) when the
+ * face is tapped during a note or the wait for its reply; the record and
+ * reply loops below consume it and abandon the turn. */
+static atomic_bool s_tap_cancel;
+
+void muse_voice_tap_cancel(void)
+{
+    atomic_store(&s_tap_cancel, true);
+}
+
 static bool record(char *why, size_t cap)
 {
     muse_state_set_mode(MUSE_MODE_LISTENING);
     muse_state_set_progress(0);
+    atomic_store(&s_tap_cancel, false);   /* a fresh press starts clean */
     s_rec_n = s_sent = 0;
     s_live = s_tried = false;
     if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
@@ -445,6 +456,15 @@ static bool record(char *why, size_t cap)
         if (!released && got_event(NOTE_TOGGLE ? MUSE_PTT_DOWN : MUSE_PTT_UP)) {
             released = true;
             stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
+        }
+        /* dev.18: a tap while listening drops the note unsent; the empty
+         * why reads as a plain cancel to the caller, which idles the face. */
+        if (atomic_exchange(&s_tap_cancel, false)) {
+            muse_hatch_turn_cancel();
+            s_live = false;
+            ok = false;
+            why[0] = '\0';
+            break;
         }
     }
     take_pre(&st, s_pre_fill);
@@ -537,6 +557,16 @@ static bool hatch_reply(bool *delivered, bool incoming)
             muse_hatch_turn_cancel();
             muse_state_set_level(0);
             return true;
+        }
+        /* dev.18: a tap while waiting abandons the wait and gives the face
+         * back. The flag is consumed either way, but once the reply is
+         * speaking a tap leaves it alone (the button still interrupts). */
+        if (atomic_exchange(&s_tap_cancel, false) && !speaking) {
+            ESP_LOGI(TAG, "reply wait cancelled by a tap");
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            go_idle("");
+            return false;
         }
         /* museStopWatch: until the reply speaks, the other sound (a mini app,
          * sound.play, voice.say) plays on as when idle; the speaker paces the
