@@ -2028,3 +2028,41 @@ muse_diy_stopwatch/miniapp/msw_app_launcher.c、version.txt。
   応答待ちタップで文字盤に戻ること、録音中タップでノートが
   送られないこと、スピーカーOFF（READ）での英語返信がフル表示で
   行頭欠けなく読めること。
+
+## 2026-11-16 — 0.3.0-dev.19
+
+### ダウンロード開始拒否の診断ログ（調査 F1 のみ）
+
+- 背景: work/install-stall-investigation-2026-11-16.md。app.install の
+  "failed to start the download" は vm_file_start() の4つの失敗
+  （calloc / パス用 malloc / vm_allocate_body のメモリゲート /
+  xTaskCreate）が1つの文言に潰れ、ヒープ数値もログに残らなかった
+  ため、実機ログからどのチェックで落ちたか切り分けできなかった。
+- 変更（ログ追加のみ。判定・返却コード・利用者向け文言・ゲート
+  予算はいずれも不変。追加バッファなし）:
+  - main/image_fetch.c vm_file_start(): 拒否したサブチェック名を
+    ESP_LOGE（"vm file download refused: <名前>"）で出し、既存の
+    log_memory() で int/dma の free/largest/min を記録する。
+    ロック確保失敗（"failed to allocate"）の経路にも同じ記録を追加。
+  - main/ota.c ota_start(): xTaskCreate 失敗時、既存の
+    "could not start OTA task" の隣に同じ形式のヒープ数値を
+    ota_log_memory() で追加記録。
+- F2（out_of_memory 時のリトライ）はユーザーが不要と判断し不採用。
+  F3（ゲート予算の再導出）は未承認のため未実施。
+
+### 検証
+
+- ホストテスト: tests.test_link_image_fetch / tests.test_link_ota は
+  変更前後（stash 比較）で同一の既存失敗3件のみ（image_fetch
+  ハーネスの heap_caps_realloc リンク不足、ota 登録ハーネスの
+  fakes 不足）。変更した image_fetch.c はホストコンパイル通過、
+  ota.c を使うテストは通過。dev.18 の確認サブセット
+  （test_muse_caption_wrap / test_muse_voice_note_backlog /
+  test_muse_turn_sleep / test_watcher_sleep_contract /
+  test_muse_battery）は全 OK、既存失敗（test_muse_full_reply 4件・
+  test_stopwatch_power 1件・test_muse_voice_note /
+  test_muse_caption_hint / test_stopwatch_controls のハーネス
+  エラー）は同一。新規失敗ゼロ。
+- 実機未検証（OTA はユーザーの指示があるときだけ）: 次回ストール時に
+  ログへ「vm file download refused: <サブチェック名>」と int/dma
+  数値が出ること。

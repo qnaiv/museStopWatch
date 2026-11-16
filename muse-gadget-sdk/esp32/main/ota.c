@@ -84,10 +84,26 @@ bool ota_installed_by_vibe_mode(void) {
 #include "esp_https_ota.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "link.ota";
+
+// The same heap figures image_fetch's log_memory() prints, so an OTA
+// start refusal can be read beside a download one (install-stall
+// investigation, 2026-11-16).
+#define OTA_BYTE_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
+static void ota_log_memory(const char *stage) {
+    ESP_LOGI(TAG, "%s: int=%uK/%uK min=%uK dma=%uK/%uK min=%uK", stage,
+             (unsigned)(heap_caps_get_free_size(OTA_BYTE_CAPS) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(OTA_BYTE_CAPS) / 1024),
+             (unsigned)(heap_caps_get_minimum_free_size(OTA_BYTE_CAPS) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024),
+             (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA) / 1024));
+}
 
 #define OTA_HTTP_TIMEOUT_MS        30000
 #define OTA_MAX_REDIRECTS          5
@@ -377,6 +393,7 @@ void ota_start(const char *url, bool force, ota_status_cb cb, void *user) {
     // 8 KB stack: TLS handshake + flash writes during the OTA download.
     if (xTaskCreate(ota_task, "ota", 16384, ctx, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "could not start OTA task");
+        ota_log_memory("ota start refused");
         free(ctx->url);
         free(ctx);
         if (cb) {

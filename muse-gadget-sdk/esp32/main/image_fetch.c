@@ -1232,6 +1232,8 @@ static bool vm_file_start(const char *path, size_t max, image_fetch_file_cb done
         return false;
     }
     if (!s_vm.lock && !(s_vm.lock = xSemaphoreCreateMutex())) {
+        ESP_LOGE(TAG, "vm file download refused: lock allocation failed");
+        log_memory("vm file download refused");
         atomic_store(&s_busy, false);
         *code = "out_of_memory";
         *message = "failed to allocate";
@@ -1240,7 +1242,16 @@ static bool vm_file_start(const char *path, size_t max, image_fetch_file_cb done
     file_fetch_t *ff = calloc(1, sizeof(*ff));
     fetch_t *f = ff ? &ff->f : NULL;
     if (f) f->url = vm_request_path(path);
-    bool ok = f && f->url && vm_allocate_body(f, FETCH_STACK_BYTES, 0);
+    // Name the sub-check that refuses the start: these used to collapse
+    // into the one "failed to start the download" with no heap numbers
+    // logged, which made an install stall undiagnosable from the device
+    // log (install-stall investigation, 2026-11-16). Logging only; the
+    // checks, codes and messages are unchanged.
+    const char *refused = !f        ? "context allocation failed"
+                          : !f->url ? "request path allocation failed"
+                                    : NULL;
+    bool ok = !refused && vm_allocate_body(f, FETCH_STACK_BYTES, 0);
+    if (!ok && !refused) refused = "body allocation gate failed";
     if (ok) {
         f->vm = true;
         f->user = user;
@@ -1250,8 +1261,11 @@ static bool vm_file_start(const char *path, size_t max, image_fetch_file_cb done
         ff->size = size;
         ff->stream_done = stream_done;
         ok = xTaskCreate(file_task, "vm_file", FETCH_STACK_BYTES, ff, 4, NULL) == pdPASS;
+        if (!ok) refused = "task creation failed";
     }
     if (!ok) {
+        ESP_LOGE(TAG, "vm file download refused: %s", refused);
+        log_memory("vm file download refused");
         if (f) {
             free(f->body);
             free(f->url);
