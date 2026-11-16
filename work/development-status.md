@@ -2363,6 +2363,13 @@ and the fragmentation they leave behind.
   期限は構造体でなくファイル静的変数 `s_pomo_end_us` が正）。
   同行を `s_pomo_end_us = 0` に修正し、pomo_load() の未使用変数
   `uint32_t u;` も除去して再 push（version は dev.22 のまま）。
+- CI #31 がビルド失敗（muse_ui.c trains_type_for() の
+  dwant/nwant[16] への "%04d-%02d-%02d" が -Werror=
+  format-truncation — int 引数を GCC は全域と見るため理論最大
+  36B）。両バッファ（関数内スタック） を 40 に拡大して再 push
+  （version は dev.22 のまま）。dev.22 の全変更コードについて
+  同種の snprintf を監査し、残りはリテラル %s か範囲の証明
+  できる %d のみであることを確認済み。
 
 ### dev.22-1: ポモドーロ
 

@@ -3765,7 +3765,7 @@ static void trains_consider(cJSON *root)
 static int trains_type_for(const struct tm *d)
 {
     if (s_trains.date[0]) {
-        char dwant[16];
+        char dwant[40];   /* %04d-%02d-%02d of full-range ints: 35 + NUL */
         snprintf(dwant, sizeof(dwant), "%04d-%02d-%02d",
                  d->tm_year + 1900, d->tm_mon + 1, d->tm_mday);
         if (!strcmp(dwant, s_trains.date)) {
@@ -3782,7 +3782,7 @@ static int trains_type_for(const struct tm *d)
             struct tm next;
             time_t tt = mktime(&base);
             if (tt != (time_t)-1 && localtime_r(&tt, &next)) {
-                char nwant[16];
+                char nwant[40];   /* same worst case as dwant */
                 snprintf(nwant, sizeof(nwant), "%04d-%02d-%02d",
                          next.tm_year + 1900, next.tm_mon + 1, next.tm_mday);
                 if (!strcmp(dwant, nwant)) {
