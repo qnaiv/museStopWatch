@@ -2220,6 +2220,18 @@ muse_diy_stopwatch/miniapp/msw_app_launcher.c、version.txt。
   描画、mbox 半減時の受信）、そして受け入れテスト
   **「ミニアプリを実行 → 終了 → app.install」**（今日失敗する
   まさにその手順）が dev.20 適用後に通るかは未確認。
+- CI #27 ビルド失敗と修正: 初回 push（dfaa33b）の build が
+  ESP-IDF の wifi_init.c の設定チェックで停止
+  （`WIFI_RX_BA_WIN should not be larger than double of the
+  WIFI_STATIC_RX_BUFFER_NUM`）。Tier A で STATIC_RX を 8→6 にした際、
+  連動する RX_BA_WIN（sdkconfig.muse の 16、上限は 2×6=12）の
+  見直しが監査から漏れていた。修正: devices/
+  sdkconfig.muse-m5stack-stopwatch に
+  `CONFIG_ESP_WIFI_RX_BA_WIN=12` をこのボード用に上書き追加
+  （version は 0.3.0-dev.20 のまま据え置き、リリースはこの修正
+  コミットで発行）。兄弟制約の確認: 同一ビルドで STATIC_TX=6 /
+  TX_BA_WIN=16 には同種の #error が出ておらず（wifi_init.c の
+  チェックは RX 側のみ）、DYNAMIC_RX=32 ≥ 12 でも問題なし。
 
 ### 内部 RAM 予算表（R10・常設）
 

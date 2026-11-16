@@ -50,6 +50,11 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # about 6.4 KB of permanent internal RAM back between them.
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+# Coupled to the RX count above: ESP-IDF's wifi_init.c rejects a build
+# whose RX_BA_WIN exceeds twice STATIC_RX_BUFFER_NUM (RX_BA_WIN <=
+# 2 x STATIC_RX_BUFFER_NUM), and sdkconfig.muse's 16 no longer fits 6.
+# 12 = 2 x 6, this board only.
+CONFIG_ESP_WIFI_RX_BA_WIN=12
 
 # As on the Waveshare 1.75C, the same chip and panel. Screen off on battery: the CPU drops to the crystal clock and light-sleeps
 # until a rim key or the M5PM1's click interrupt (GPIO12) wakes it, with the
