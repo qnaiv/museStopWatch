@@ -1952,6 +1952,12 @@ muse_diy_stopwatch/miniapp/msw_app_launcher.c、version.txt。
   集計行、workspace/battery_history.json が実際に書き出されること、
   app.store_put した ToDo が次回起動時に表示されること、NVS 永続化と
   スリープ中の記録間隔。
+- 追記（2026-11-17）: グラフの描画は実機で確認できた（ユーザーが
+  線の表示を確認）。一方アップロードは dev.17〜dev.20 の全期間を
+  通して一度も成功していなかったことが判明した（battery_history.json
+  は一度も書かれていない）。失敗は ESP_LOGW にしか残らず、成功判定
+  も HTTP 200 のみで {ok, result} エンベロープを見ていなかったため、
+  端末上では成功と区別がつかなかった。修正は dev.21（下記）。
 
 ## 2026-11-16 — 0.3.0-dev.18
 
@@ -2289,3 +2295,57 @@ and the fragmentation they leave behind.
 - TJpgDec プール 2箇所 PSRAM 化（2.2 の該当2行は解消）
 - app.install / device.ota は reserve が資金源になり、ゲートは
   tripwire として存続（R7）
+
+## 2026-11-17 — 0.3.0-dev.21
+
+### バッテリー履歴アップロードの修正（dev.17 の不達対策）
+
+- 背景: dev.17 の履歴アップロード（muse_ui.c batt_hist_task →
+  POST /fs/write、workspace/battery_history.json、6000 文字ピース）
+  は出荷以来一度もファイルが届いていなかった（dev.17〜dev.20 の
+  全バージョンで不達。2026-11-17 の監査で確定）。記録とグラフは
+  実機で正常（ユーザーが線の描画を確認）。失敗は ESP_LOGW のみに
+  残り、成功判定は HTTP ステータスのみで、デーモンの {ok, result}
+  エンベロープを解析していなかった（/fs/read 側は dash_read_chunk
+  で ok を見ている）。最有力の仮説はデーモン側が gadget の
+  /fs/write を拒否していること（dev.10 で /fs/read のベアな
+  ホームパスが 403 になり、dev.11 でパス形式変更＋GET /fs/raw 化
+  して解決した前例）。
+- 変更:
+  1. **エンベロープ判定**（muse_ui.c）: batt_hist_write_piece が
+     返信を dash_read_chunk と同じ作法で解析するようにした
+     （batt_hist_reply_ok: cJSON で ok を読み、true / false /
+     欠落 / 解析不能を区別）。ピースの成功は「HTTP 200 かつ
+     エンベロープが解析可能で ok が false でないこと」。
+     muse_battery_hist_mark_sent() は全ピースがこの条件を満たした
+     ときだけ呼ばれる。なお /fs/write の成功応答はハーネス
+     （tests/link_daemon_requests_harness.cpp）のモデルでは
+     {"ok":true} で result を持たないため、read 側と違い result の
+     存在は要求しない。
+  2. **Battery ページに最終試行を表示**（muse_ui.c /
+     muse_ui.h / muse_settings_ui.c）: 最後のアップロード試行を
+     muse_batt_hist_up_t（終了時刻・到達ステージ
+     NONE/WAIT_LINK/DASH_BUSY/BUILD/WRITE/DONE・失敗ピース番号・
+     その HTTP ステータス・ok の値・返信の先頭最大48文字・使用した
+     パス形式）に保持し、muse_batt_hist_upload_last() で公開。
+     Settings > Battery の「24時間の消費」「7日間の消費」の下に
+     note 2行を追加し、tick のたびに更新する（成功時は
+     「履歴を送信しました HH:MM」、失敗時はステージと HTTP/ok、
+     2行目にデーモンの返信スニペット）。dash の s_dash_err と
+     同じ「ログは読めないので画面に出す」作法。
+  3. **パス形式フォールバック**（muse_ui.c）: ピースが 403 または
+     ok:false で拒否された場合、その試行の中で次のパス形式で
+     アップロード全体をやり直す。候補は順に
+     "workspace/battery_history.json"（従来）/
+     "/workspace/battery_history.json" / "battery_history.json"。
+     成功した形式は次回以降の先行形式として保持され、状態 note
+     にも残る。それ以外の失敗（タイムアウト・送信失敗・解析不能）
+     では形式を進めない。
+- 検証: ホストテスト全スイート（952 件、unittest discover）で
+  失敗・エラー一覧が dev.20 時点のベースラインと完全一致
+  （failures=15 / errors=35 / skipped=10、新規失敗ゼロ）。
+- 実機未検証（OTA はユーザーの別途指示があるときだけ）:
+  アップロードが実際に届くようになったか、Battery ページの
+  状態 note の見え方、パス形式フォールバックがどの形式で
+  通るか（デーモンが 403 を返すのか ok:false なのかの切り分け
+  自体がこの note で初めて可能になる）。

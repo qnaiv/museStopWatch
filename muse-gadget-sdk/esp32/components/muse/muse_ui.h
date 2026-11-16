@@ -62,6 +62,29 @@ void muse_ui_set_yellow_long(int action, const char *app_id);
  * call often (the Battery page's tick does): it starts nothing while an
  * upload is recent, running, or barely owed. */
 void muse_batt_hist_upload_request(void);
+/* museStopWatch dev.21: the last upload attempt, for the Battery page's
+ * note — dev.17's failures went only to the log, which cannot be read
+ * off the device, so a refused upload looked exactly like a landed one.
+ * stage is one of MUSE_BATT_HIST_UP_*; when it is UP_WRITE, piece (0-based),
+ * http (0: no reply arrived), ok (1 true, 0 false, -1 absent/unread) and
+ * reply (the reply's first bytes) describe the piece that failed. path is
+ * the /fs/write path form the attempt used (0 "workspace/…", 1
+ * "/workspace/…", 2 the bare name); at is when the attempt ended (wall
+ * clock, seconds). */
+enum {
+    MUSE_BATT_HIST_UP_NONE = 0,      /* no attempt yet this boot */
+    MUSE_BATT_HIST_UP_WAIT_LINK,     /* the session never came up */
+    MUSE_BATT_HIST_UP_DASH_BUSY,     /* a dash fetch was running; skipped */
+    MUSE_BATT_HIST_UP_BUILD,         /* nothing to send */
+    MUSE_BATT_HIST_UP_WRITE,         /* a piece failed */
+    MUSE_BATT_HIST_UP_DONE,          /* every piece landed */
+};
+typedef struct {
+    int64_t at;
+    int stage, piece, http, ok, path;
+    char reply[49];
+} muse_batt_hist_up_t;
+void muse_batt_hist_upload_last(muse_batt_hist_up_t *out);
 #endif
 /* Settings sub-pages turn off the tile swipe so they can use horizontal gestures. */
 void muse_ui_set_swipe_enabled(bool enabled);

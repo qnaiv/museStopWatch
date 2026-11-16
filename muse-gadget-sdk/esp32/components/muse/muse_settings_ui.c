@@ -149,7 +149,9 @@ static lv_obj_t *s_slpchk_checks[SLPCHK_COUNT];
 static lv_obj_t *s_batt_status, *s_batt_level, *s_batt_drain, *s_batt_full, *s_batt_off, *s_batt_slept, *s_batt_wakes,
     *s_batt_busy, *s_batt_awake;
 /* The history (dev.17): the last day's chart and the two drain rows. */
-static lv_obj_t *s_batt_chart, *s_batt_hist_note, *s_batt_day, *s_batt_week;
+/* dev.21: two more notes under them — the last upload's outcome and, for
+ * a refused piece, what the daemon answered. */
+static lv_obj_t *s_batt_chart, *s_batt_hist_note, *s_batt_day, *s_batt_week, *s_batt_upload, *s_batt_up_reply;
 static lv_chart_series_t *s_batt_series;
 static uint32_t s_batt_hist_sig;   /* count and last epoch, so the chart refills only on a new point */
 static int64_t s_batt_shown_us;
@@ -1537,6 +1539,10 @@ static void build_battery_page(lv_obj_t *tile)
     s_batt_hist_note = note(list, "過去24時間の推移（左が古い、充電中は上昇します）");
     s_batt_day = info_row(list, "24時間の消費");
     s_batt_week = info_row(list, "7日間の消費");
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    s_batt_upload = note(list, "");
+    s_batt_up_reply = note(list, "");
+#endif
     s_batt_hist_sig = 0;
     s_batt_level = info_row(list, "残量");   /* museStopWatch: Japanese */
     s_batt_drain = info_row(list, "使った量");
@@ -1552,6 +1558,57 @@ static void build_battery_page(lv_obj_t *tile)
                "チップ休止は省電力の眠り（ライトスリープ）、CPU 稼働はどれかのコアが処理をしていた時間です。");
 }
 
+/* dev.21: the upload note under the drain rows: the last attempt's stage,
+ * and the daemon's answer when a piece was refused. Refreshed on every
+ * tick, not only on a new point — an attempt can end while the page is
+ * open (the page's own opening asks for it). */
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+static void tick_battery_upload(void)
+{
+    muse_batt_hist_up_t up;
+    muse_batt_hist_upload_last(&up);
+    char buf[96], t[8] = "";
+    if (up.at > 1700000000LL) {   /* the wall clock is set */
+        time_t at = (time_t)up.at;
+        struct tm tmv;
+        if (localtime_r(&at, &tmv)) {
+            snprintf(t, sizeof(t), " %d:%02d", tmv.tm_hour, tmv.tm_min);
+        }
+    }
+    switch (up.stage) {
+    case MUSE_BATT_HIST_UP_DONE:
+        if (up.path > 0) {
+            snprintf(buf, sizeof(buf), "履歴を送信しました%s（パス形式%d）", t, up.path + 1);
+        } else {
+            snprintf(buf, sizeof(buf), "履歴を送信しました%s", t);
+        }
+        break;
+    case MUSE_BATT_HIST_UP_WAIT_LINK:
+        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 接続待ち時間切れ", t);
+        break;
+    case MUSE_BATT_HIST_UP_DASH_BUSY:
+        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 取得処理と競合", t);
+        break;
+    case MUSE_BATT_HIST_UP_BUILD:
+        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 送信データなし", t);
+        break;
+    case MUSE_BATT_HIST_UP_WRITE:
+        if (up.http > 0) {
+            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目 HTTP %d%s", t, up.piece + 1,
+                     up.http, up.ok == 0 ? " ok=false" : up.ok == 1 ? " ok=true" : "");
+        } else {
+            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目 応答なし", t, up.piece + 1);
+        }
+        break;
+    default:
+        strlcpy(buf, "履歴はまだ送信していません", sizeof(buf));
+        break;
+    }
+    set_text(s_batt_upload, buf);
+    set_text(s_batt_up_reply, up.reply);
+}
+#endif
+
 /* dev.17: the chart (the last BATT_CHART_POINTS points, gaps before the
  * first of them), the note's time range and the two drain rows; refilled
  * only when a new point lands. Opening the page also asks muse_ui to upload
@@ -1560,6 +1617,7 @@ static void tick_battery_hist(void)
 {
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     muse_batt_hist_upload_request();   /* dev.17: the upload lives in muse_ui.c */
+    tick_battery_upload();             /* dev.21: and show how the last one went */
 #endif
     int n = muse_battery_hist_count();
     muse_batt_point_t last;
