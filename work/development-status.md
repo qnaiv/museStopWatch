@@ -2359,6 +2359,10 @@ and the fragmentation they leave behind.
   ポモドーロは設計どおりファーム側で dev.16 タイマーの拡張。
   次の電車は時計側のみで、時刻表の取得スクリプトと版 cron への
   trains 同梱は別作業（下記スキーマが契約）。
+- CI #30 がビルド失敗（muse_ui.c:3049 `s_pomo.end_us` — 実行時
+  期限は構造体でなくファイル静的変数 `s_pomo_end_us` が正）。
+  同行を `s_pomo_end_us = 0` に修正し、pomo_load() の未使用変数
+  `uint32_t u;` も除去して再 push（version は dev.22 のまま）。
 
 ### dev.22-1: ポモドーロ
 

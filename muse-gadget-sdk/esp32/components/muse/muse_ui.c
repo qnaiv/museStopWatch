@@ -2720,7 +2720,6 @@ static void pomo_load(void)
         return;   /* RAM only this boot */
     }
     uint8_t b;
-    uint32_t u;
     if (nvs_get_u8(s_care_nvs, "pomo_foc", &b) == ESP_OK && b >= 1 && b <= 180) s_pomo.focus_min = b;
     if (nvs_get_u8(s_care_nvs, "pomo_brk", &b) == ESP_OK && b >= 1 && b <= 60) s_pomo.break_min = b;
     if (nvs_get_u8(s_care_nvs, "pomo_lng", &b) == ESP_OK && b >= 1 && b <= 90) s_pomo.long_min = b;
@@ -3046,7 +3045,7 @@ static void update_pomodoro(float now)
         s_pomo_fired = false;
         int ended = s_pomo.phase;
         pomo_advance();
-        s_pomo.end_us = 0;
+        s_pomo_end_us = 0;
         s_pomo.paused = false;
         s_pomo_alert_ended = ended;
         if (s_tv && s_face) {
