@@ -256,9 +256,26 @@ static lv_obj_t *s_clock_box, *s_clock_time, *s_clock_date;
  * (render_dash keeps the strings in s_dash_wx / s_dash_next), and the
  * running timer's remaining time. dev.14's battery row is gone: the
  * header chrome at the top of the face already shows the battery. */
-static lv_obj_t *s_clock_wx, *s_clock_next, *s_clock_timer;
+static lv_obj_t *s_clock_wx, *s_clock_next, *s_clock_timer, *s_clock_train;
 static char s_dash_wx[96];
 static char s_dash_next[128];
+/* dev.22: the next-train cache (the section by render_dash()). The
+ * edition's trains block, validated and kept in NVS so the clock face
+ * can count departures down from the RTC alone, with no fetch of its
+ * own. Tables are minutes from midnight (up to 25:59 for the small
+ * hours), one per day type: 0 weekday, 1 Saturday, 2 holiday. */
+#define TRAINS_MAX 160
+static struct {
+    bool loaded, present;
+    uint8_t walk;            /* minutes from home to the platform */
+    char date[11];           /* the edition's days.date ("YYYY-MM-DD"); "" = no flags */
+    uint8_t dt_today, dt_tom;
+    uint8_t n[3];
+    uint16_t mins[3][TRAINS_MAX];
+    uint32_t hash;           /* change detection, so NVS is written once per timetable */
+} s_trains;
+static void trains_line(char *buf, size_t cap, const struct tm *local, bool have_time);   /* the dash section, below */
+static void trains_consider(cJSON *root);   /* the dash section, below */
 static int64_t s_dash_info_us;   /* when the edition behind those strings landed (the dash section's s_dash_ok_us, copied by render_dash) */
 static bool s_clock_mode;              /* the face shows the clock */
 static bool s_clock_shown;             /* the clock box is up right now */
@@ -290,6 +307,37 @@ static bool s_timer_paused;
 static float s_timer_alert_until;        /* the alert overlay's deadline, frame time */
 static float s_timer_alert_last;         /* the last alert pulse/chirp, frame time */
 static int timer_left_s(void);           /* below update_care(); -1 while not counting */
+/* dev.22: the pomodoro (the section after update_timer()). A phase
+ * chain on the timer's esp_timer pattern — 25 min focus, 5 min break,
+ * a long break after 4 focuses, all Settings-tunable — with its state
+ * in the care NVS handle so a session survives sleep and reboots. It
+ * and the plain timer are exclusive: starting one cancels the other. */
+enum { POMO_FOCUS = 0, POMO_BREAK = 1, POMO_LONG = 2, POMO_IDLE = 3 };
+static struct {
+    bool loaded;
+    int focus_min, break_min, long_min, sets;   /* the Settings > Pomodoro values */
+    uint8_t phase;           /* POMO_*; POMO_IDLE = no session */
+    uint8_t done;            /* focuses finished in the current round */
+    bool paused;
+    int left_s;              /* seconds left, while paused */
+    bool arm_pending;        /* a restored session re-arms in update_pomodoro() */
+} s_pomo = { .focus_min = 25, .break_min = 5, .long_min = 15, .sets = 4, .phase = POMO_IDLE };
+static lv_obj_t *s_pomo_panel, *s_pomo_time, *s_pomo_state, *s_pomo_dots, *s_pomo_main_lbl;
+static lv_obj_t *s_pomo_skip_btn, *s_pomo_end_btn;
+static lv_obj_t *s_pomo_alert, *s_pomo_alert_title, *s_pomo_alert_sub;
+static bool s_pomo_open;
+static volatile int s_pomo_open_reqs;    /* muse_ui_request_pomodoro(), any task */
+static int s_pomo_open_done;
+static volatile bool s_pomo_fired;       /* set by the esp_timer callback */
+static esp_timer_handle_t s_pomo_esp;
+static int64_t s_pomo_end_us;            /* monotonic end of the running phase; 0 = not running */
+static float s_pomo_alert_until;         /* the alert overlay's deadline, frame time */
+static float s_pomo_alert_last;          /* the last alert pulse/chirp, frame time */
+static int s_pomo_alert_ended;           /* the phase the live alert ended (POMO_*) */
+static void pomo_load(void);             /* the pomodoro section, below */
+static void pomo_save(void);             /* the pomodoro section, below */
+static void pomo_close_panel(void);      /* the pomodoro section, below */
+static void pomo_end_session(void);      /* the pomodoro section, below */
 /* dev.16: the yellow button's long-press assignment (Settings > Yellow
  * button), in the care NVS handle beside face_mode. The action defaults
  * to the timer; the app id matters only for MUSE_YEL_LONG_APP. */
@@ -390,11 +438,12 @@ static void care_load(void)
         if (nvs_get_u16(s_care_nvs, "care_bond", &bond) == ESP_OK) s_care.bond = bond;
         if (nvs_get_u32(s_care_nvs, "care_ts", &ts) == ESP_OK) s_care.anchor = ts;
         if (nvs_get_u8(s_care_nvs, "face_mode", &b) == ESP_OK) s_clock_mode = b != 0;
-        if (nvs_get_u8(s_care_nvs, "yel_l_act", &b) == ESP_OK && b <= MUSE_YEL_LONG_NONE) s_yel_long_act = b;
+        if (nvs_get_u8(s_care_nvs, "yel_l_act", &b) == ESP_OK && b <= MUSE_YEL_LONG_POMODORO) s_yel_long_act = b;
         size_t yn = sizeof(s_yel_long_app);
         if (nvs_get_str(s_care_nvs, "yel_l_app", s_yel_long_app, &yn) != ESP_OK) s_yel_long_app[0] = '\0';
     }
     care_settle();   /* the time away since the last save counts too */
+    pomo_load();     /* dev.22: the pomodoro's settings and session ride the same handle */
 }
 
 /* 0, 1 or 2: the evolution stage the lifetime bond has reached. */
@@ -439,7 +488,7 @@ const char *muse_ui_yellow_long_app(void)
 void muse_ui_set_yellow_long(int action, const char *app_id)
 {
     care_load();
-    s_yel_long_act = action >= 0 && action <= MUSE_YEL_LONG_NONE ? (uint8_t)action : MUSE_YEL_LONG_TIMER;
+    s_yel_long_act = action >= 0 && action <= MUSE_YEL_LONG_POMODORO ? (uint8_t)action : MUSE_YEL_LONG_TIMER;
     snprintf(s_yel_long_app, sizeof(s_yel_long_app), "%s", app_id ? app_id : "");
     if (s_care_nvs) {
         nvs_set_u8(s_care_nvs, "yel_l_act", s_yel_long_act);
@@ -452,6 +501,12 @@ void muse_ui_set_yellow_long(int action, const char *app_id)
 void muse_ui_request_timer(void)
 {
     s_timer_open_reqs++;
+}
+
+/* dev.22: a pomodoro-open request (any task); update_pomodoro() applies it. */
+void muse_ui_request_pomodoro(void)
+{
+    s_pomo_open_reqs++;
 }
 #endif
 /* The avatar's resting size: on the StopWatch a cared-for avatar grows a
@@ -1732,6 +1787,13 @@ static void on_quick_timer(lv_event_t *e)
     muse_ui_request_timer();
 }
 
+/* dev.22: the pomodoro's door on this tile, beside the timer's. */
+static void on_quick_pomodoro(lv_event_t *e)
+{
+    (void)e;
+    muse_ui_request_pomodoro();
+}
+
 static lv_obj_t *quick_slider(lv_obj_t *tile, const lv_font_t *font, const char *name, int y,
                               int min, int max, int val, lv_event_cb_t cb, lv_obj_t **val_out)
 {
@@ -1782,11 +1844,16 @@ static void build_quick(lv_obj_t *tile)
         s_quick_snd_lbl[mode] = l;
     }
     lv_obj_t *settings = hist_button(tile, font, "設定", on_quick_settings);
-    lv_obj_set_size(settings, 150, 48);
-    lv_obj_align(settings, LV_ALIGN_TOP_MID, -80, 356);
+    lv_obj_set_size(settings, 104, 48);
+    lv_obj_align(settings, LV_ALIGN_TOP_MID, -112, 356);
     lv_obj_t *timer = hist_button(tile, font, "タイマー", on_quick_timer);
-    lv_obj_set_size(timer, 150, 48);
-    lv_obj_align(timer, LV_ALIGN_TOP_MID, 80, 356);
+    lv_obj_set_size(timer, 104, 48);
+    lv_obj_align(timer, LV_ALIGN_TOP_MID, 0, 356);
+    /* dev.22: the pomodoro joins the row; three across at the sound
+     * buttons' width, so 設定 and タイマー narrow to match. */
+    lv_obj_t *pomo = hist_button(tile, font, "ポモドーロ", on_quick_pomodoro);
+    lv_obj_set_size(pomo, 104, 48);
+    lv_obj_align(pomo, LV_ALIGN_TOP_MID, 112, 356);
     lv_obj_t *hint = make_label(tile, font, COLOR_DIM);
     lv_label_set_text(hint, "上にスワイプでもどる");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -30);
@@ -2073,6 +2140,12 @@ static void build_clock(lv_obj_t *face)
     lv_obj_set_size(s_clock_timer, 340, LV_SIZE_CONTENT);
     lv_obj_set_style_text_align(s_clock_timer, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_clock_timer, LV_LABEL_LONG_MODE_DOTS);
+    /* dev.22: under those, the next train — from the timetable the
+     * edition carried (trains_line(), by render_dash()). */
+    s_clock_train = make_label(s_clock_box, caption_font(), COLOR_DIM);
+    lv_obj_set_size(s_clock_train, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_clock_train, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_clock_train, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_add_flag(s_clock_box, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -2141,6 +2214,16 @@ static void update_face_mode(void)
         lv_label_set_text(s_clock_next, nx);
     }
     lv_obj_set_flag(s_clock_next, LV_OBJ_FLAG_HIDDEN, !nx[0]);
+    /* dev.22: the next train, counted down from the RTC against the
+     * cached timetable — no freshness gate like the edition lines
+     * above: a timetable stays true until a newer edition replaces
+     * it, which is the point of caching it in NVS. */
+    char tbuf[64];
+    trains_line(tbuf, sizeof(tbuf), &local, have_time);
+    if (strcmp(tbuf, lv_label_get_text(s_clock_train)) != 0) {
+        lv_label_set_text(s_clock_train, tbuf);
+    }
+    lv_obj_set_flag(s_clock_train, LV_OBJ_FLAG_HIDDEN, !tbuf[0]);
 }
 
 /* Place the evolution accessories over the sprite: the bell at grid
@@ -2347,6 +2430,9 @@ static void on_timer_main(lv_event_t *e)
         s_timer_paused = false;
         timer_arm();
     } else {   /* start */
+        if (s_pomo.phase != POMO_IDLE) {
+            pomo_end_session();   /* dev.22: the two never run at once */
+        }
         s_timer_end_us = esp_timer_get_time() + (int64_t)s_timer_set_s * 1000000;
         timer_arm();
     }
@@ -2473,6 +2559,7 @@ static void update_timer(float now)
             lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
         }
         care_close_panel();
+        pomo_close_panel();
         s_timer_open = true;
         lv_obj_remove_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_timer_panel);
@@ -2487,6 +2574,7 @@ static void update_timer(float now)
             lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
         }
         care_close_panel();
+        pomo_close_panel();
         timer_close_panel();
         char buf[16];
         timer_fmt(buf, sizeof(buf), s_timer_set_s);
@@ -2528,6 +2616,537 @@ static void update_timer(float now)
             lv_label_set_text(s_clock_timer, buf);
         }
         lv_obj_set_flag(s_clock_timer, LV_OBJ_FLAG_HIDDEN, !buf[0]);
+    }
+}
+
+/*
+ * dev.22: the pomodoro — the timer's sibling, a chain of phases
+ * instead of one countdown: focus (25 min) → break (5 min), and a
+ * long break (15 min) after 4 focuses, the lengths and the count
+ * tunable in Settings > Pomodoro. It borrows the timer's whole shape:
+ * a panel over the face reached three ways (the quick tile's
+ * ポモドーロ button, the launcher's built-in cell, the yellow
+ * button's long press) through muse_ui_request_pomodoro(); an
+ * esp_timer finish that lands while the watch sleeps, its callback
+ * only flagging and waking; an alert update_pomodoro() raises on the
+ * first frame back, sounded by the sound mode — pulses and chirps,
+ * never speech — for up to 30 s. Two things are its own: the alert
+ * tells a focus ending from a break ending (a focus ends with two
+ * chirps a beat and a 1.2 s beat, a break with one chirp and a 2.4 s
+ * beat, and the words 集中おわり / 休憩おわり), and stopping the
+ * alert — a tap, or the 30 s running out — starts the next phase at
+ * once, so the rhythm survives a missed alert. It and the plain
+ * timer are exclusive: starting one cancels the other (one alert
+ * path, one clock row). The state persists in the care NVS handle:
+ * settings, the phase, its wall-clock end, the round's finished
+ * focuses. On reboot a phase whose end is still ahead resumes with
+ * what is left; one that ended while the watch was off does NOT
+ * sound — the session waits, paused at the next phase's start.
+ * While the panel is up, みゃおっち rides in it small (the face's
+ * own image, shared) and follows the phase — calm through a focus,
+ * happy on a break — by the pose override in the frame tick; the
+ * care meters are neither read nor moved for it.
+ */
+static int pomo_len_s(int phase)
+{
+    return (phase == POMO_FOCUS ? s_pomo.focus_min
+            : phase == POMO_BREAK ? s_pomo.break_min
+            : phase == POMO_LONG  ? s_pomo.long_min : 0) * 60;
+}
+
+static const char *pomo_name(int phase)
+{
+    return phase == POMO_FOCUS ? "集中" : phase == POMO_BREAK ? "休憩"
+           : phase == POMO_LONG ? "長い休憩" : "";
+}
+
+static int pomo_left_s(void)
+{
+    if (s_pomo_end_us) {
+        int64_t left = (s_pomo_end_us - esp_timer_get_time()) / 1000000;
+        return left > 0 ? (int)left : 0;
+    }
+    return s_pomo.paused ? s_pomo.left_s : -1;
+}
+
+static void pomo_save(void)
+{
+    if (!s_care_nvs) {
+        return;
+    }
+    nvs_set_u8(s_care_nvs, "pomo_foc", (uint8_t)s_pomo.focus_min);
+    nvs_set_u8(s_care_nvs, "pomo_brk", (uint8_t)s_pomo.break_min);
+    nvs_set_u8(s_care_nvs, "pomo_lng", (uint8_t)s_pomo.long_min);
+    nvs_set_u8(s_care_nvs, "pomo_nst", (uint8_t)s_pomo.sets);
+    nvs_set_u8(s_care_nvs, "pomo_pha", s_pomo.phase);
+    nvs_set_u8(s_care_nvs, "pomo_cnt", s_pomo.done);
+    nvs_set_u8(s_care_nvs, "pomo_pau", s_pomo.paused ? 1 : 0);
+    int left = pomo_left_s();
+    nvs_set_u32(s_care_nvs, "pomo_lft", (uint32_t)(left > 0 ? left : 0));
+    uint32_t end_s = 0;
+    uint32_t now;
+    if (s_pomo_end_us && care_now(&now)) {
+        int64_t ahead = (s_pomo_end_us - esp_timer_get_time()) / 1000000;
+        if (ahead > 0) {
+            end_s = now + (uint32_t)ahead;   /* the phase's wall-clock end */
+        }
+    }
+    nvs_set_u32(s_care_nvs, "pomo_end", end_s);
+    nvs_commit(s_care_nvs);
+}
+
+/* The phase after this one; a finished focus counts towards the
+ * long break, a finished long break opens a fresh round. */
+static void pomo_advance(void)
+{
+    if (s_pomo.phase == POMO_FOCUS) {
+        s_pomo.done++;
+        s_pomo.phase = s_pomo.done >= s_pomo.sets ? POMO_LONG : POMO_BREAK;
+    } else if (s_pomo.phase == POMO_BREAK) {
+        s_pomo.phase = POMO_FOCUS;
+    } else {
+        s_pomo.done = 0;
+        s_pomo.phase = POMO_FOCUS;
+    }
+}
+
+static void pomo_load(void)
+{
+    if (s_pomo.loaded) {
+        return;
+    }
+    s_pomo.loaded = true;
+    if (!s_care_nvs) {
+        return;   /* RAM only this boot */
+    }
+    uint8_t b;
+    uint32_t u;
+    if (nvs_get_u8(s_care_nvs, "pomo_foc", &b) == ESP_OK && b >= 1 && b <= 180) s_pomo.focus_min = b;
+    if (nvs_get_u8(s_care_nvs, "pomo_brk", &b) == ESP_OK && b >= 1 && b <= 60) s_pomo.break_min = b;
+    if (nvs_get_u8(s_care_nvs, "pomo_lng", &b) == ESP_OK && b >= 1 && b <= 90) s_pomo.long_min = b;
+    if (nvs_get_u8(s_care_nvs, "pomo_nst", &b) == ESP_OK && b >= 2 && b <= 8) s_pomo.sets = b;
+    if (nvs_get_u8(s_care_nvs, "pomo_pha", &b) == ESP_OK && b <= POMO_IDLE) s_pomo.phase = b;
+    if (nvs_get_u8(s_care_nvs, "pomo_cnt", &b) == ESP_OK && b <= 8) s_pomo.done = b;
+    if (s_pomo.phase == POMO_IDLE) {
+        return;
+    }
+    uint32_t lft = 0, end_s = 0;
+    nvs_get_u32(s_care_nvs, "pomo_lft", &lft);
+    nvs_get_u32(s_care_nvs, "pomo_end", &end_s);
+    bool paused = nvs_get_u8(s_care_nvs, "pomo_pau", &b) == ESP_OK && b;
+    uint32_t now;
+    if (paused) {
+        s_pomo.paused = true;
+        s_pomo.left_s = lft > 0 ? (int)lft : pomo_len_s(s_pomo.phase);
+    } else if (end_s && care_now(&now)) {
+        int64_t left = (int64_t)end_s - (int64_t)now;
+        if (left > 0) {
+            /* Still running: re-arm against the monotonic clock in
+             * update_pomodoro(), once the panel side exists. */
+            s_pomo_end_us = esp_timer_get_time() + left * 1000000;
+            s_pomo.arm_pending = true;
+        } else {
+            /* The phase ended while the watch was off: no alert —
+             * the next phase waits at its start, paused. */
+            pomo_advance();
+            s_pomo.paused = true;
+            s_pomo.left_s = pomo_len_s(s_pomo.phase);
+        }
+    } else {
+        /* No wall clock to reckon the end by: hold what was left. */
+        s_pomo.paused = true;
+        s_pomo.left_s = lft > 0 ? (int)lft : pomo_len_s(s_pomo.phase);
+    }
+}
+
+static void pomo_esp_cb(void *arg)
+{
+    (void)arg;
+    s_pomo_fired = true;
+    muse_state_set_asleep(false);   /* wake: the alert is the point */
+}
+
+static void pomo_arm(void)
+{
+    if (!s_pomo_esp) {
+        const esp_timer_create_args_t args = { .callback = pomo_esp_cb, .name = "pomo" };
+        if (esp_timer_create(&args, &s_pomo_esp) != ESP_OK) {
+            s_pomo_esp = NULL;
+            return;
+        }
+    }
+    esp_timer_stop(s_pomo_esp);
+    int64_t left = s_pomo_end_us - esp_timer_get_time();
+    if (left > 0) {
+        esp_timer_start_once(s_pomo_esp, (uint64_t)left);
+    }
+}
+
+static void pomo_start_phase(void)
+{
+    s_pomo_end_us = esp_timer_get_time() + (int64_t)pomo_len_s(s_pomo.phase) * 1000000;
+    s_pomo.paused = false;
+    pomo_arm();
+    pomo_save();
+}
+
+static void pomo_close_panel(void)
+{
+    s_pomo_open = false;
+    if (s_pomo_panel) {
+        lv_obj_add_flag(s_pomo_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void pomo_end_session(void)
+{
+    s_pomo.phase = POMO_IDLE;
+    s_pomo.done = 0;
+    s_pomo_end_us = 0;
+    s_pomo.paused = false;
+    if (s_pomo_esp) {
+        esp_timer_stop(s_pomo_esp);
+    }
+    s_pomo_alert_until = 0;
+    if (s_pomo_alert) {
+        lv_obj_add_flag(s_pomo_alert, LV_OBJ_FLAG_HIDDEN);
+    }
+    pomo_save();
+}
+
+/* The alert is over (a tap, or its 30 s): the next phase starts. */
+static void pomo_stop_alert(void)
+{
+    if (!s_pomo_alert_until) {
+        return;
+    }
+    s_pomo_alert_until = 0;
+    if (s_pomo_alert) {
+        lv_obj_add_flag(s_pomo_alert, LV_OBJ_FLAG_HIDDEN);
+    }
+    pomo_start_phase();
+}
+
+static void pomo_refresh(bool force)
+{
+    static int shown_s = -1, shown_state = -1;
+    /* set / running / paused-at-start / paused / alert-pending */
+    int state = s_pomo.phase == POMO_IDLE ? 0
+                : s_pomo_alert_until > 0 ? 4
+                : s_pomo_end_us ? 1
+                : s_pomo.left_s >= pomo_len_s(s_pomo.phase) ? 2 : 3;
+    int secs = state == 0 ? s_pomo.focus_min * 60
+               : state == 1 ? pomo_left_s()
+               : s_pomo.left_s;
+    if (state == 4) {
+        secs = pomo_len_s(s_pomo.phase);   /* the next phase, whole */
+    }
+    if (!force && secs == shown_s && state == shown_state) {
+        return;
+    }
+    shown_s = secs;
+    shown_state = state;
+    char buf[40];
+    timer_fmt(buf, sizeof(buf), secs);
+    lv_label_set_text(s_pomo_time, buf);
+    if (state == 0) {
+        lv_label_set_text(s_pomo_state, "セット中");
+    } else if (state == 4) {
+        snprintf(buf, sizeof(buf), "%s 開始待ち", pomo_name(s_pomo.phase));
+        lv_label_set_text(s_pomo_state, buf);
+    } else {
+        snprintf(buf, sizeof(buf), "%s %s", pomo_name(s_pomo.phase),
+                 state == 1 ? "計測中" : state == 2 ? "開始待ち" : "一時停止中");
+        lv_label_set_text(s_pomo_state, buf);
+    }
+    /* The round's dots: one per focus in the round, filled as they land. */
+    char dots[28];
+    size_t dn = 0;
+    for (int i = 0; i < s_pomo.sets && dn + 4 < sizeof(dots); i++) {
+        const char *d = i < s_pomo.done ? "●" : "○";
+        memcpy(dots + dn, d, 3);
+        dn += 3;
+    }
+    dots[dn] = '\0';
+    lv_label_set_text(s_pomo_dots, dots);
+    lv_label_set_text(s_pomo_main_lbl, state == 1 ? "一時停止" : state == 3 ? "再開" : "スタート");
+    lv_obj_set_flag(s_pomo_skip_btn, LV_OBJ_FLAG_HIDDEN, state == 0);
+    lv_obj_set_flag(s_pomo_end_btn, LV_OBJ_FLAG_HIDDEN, state == 0);
+}
+
+static void on_pomo_close(lv_event_t *e)
+{
+    (void)e;
+    pomo_close_panel();
+}
+
+static void on_pomo_main(lv_event_t *e)
+{
+    (void)e;
+    if (s_pomo_alert_until > 0) {   /* the panel reopened over the alert */
+        pomo_stop_alert();
+    } else if (s_pomo_end_us) {   /* pause: freeze what is left */
+        s_pomo.left_s = pomo_left_s();
+        s_pomo_end_us = 0;
+        s_pomo.paused = true;
+        if (s_pomo_esp) esp_timer_stop(s_pomo_esp);
+        pomo_save();
+    } else if (s_pomo.phase == POMO_IDLE) {   /* a fresh session */
+        if (s_timer_end_us || s_timer_paused) {   /* the timer gives way */
+            s_timer_end_us = 0;
+            s_timer_paused = false;
+            if (s_timer_esp) esp_timer_stop(s_timer_esp);
+            timer_refresh(true);
+        }
+        s_pomo.phase = POMO_FOCUS;
+        s_pomo.done = 0;
+        pomo_start_phase();
+    } else if (s_pomo.left_s >= pomo_len_s(s_pomo.phase)) {   /* at a phase's start */
+        pomo_start_phase();
+    } else {   /* resume */
+        s_pomo_end_us = esp_timer_get_time() + (int64_t)s_pomo.left_s * 1000000;
+        s_pomo.paused = false;
+        pomo_arm();
+        pomo_save();
+    }
+    pomo_refresh(true);
+}
+
+static void on_pomo_skip(lv_event_t *e)
+{
+    (void)e;
+    if (s_pomo_alert_until > 0) {
+        pomo_stop_alert();
+    } else if (s_pomo.phase != POMO_IDLE) {   /* on to the next phase, counted */
+        pomo_advance();
+        pomo_start_phase();
+    }
+    pomo_refresh(true);
+}
+
+static void on_pomo_end(lv_event_t *e)
+{
+    (void)e;
+    pomo_end_session();
+    pomo_refresh(true);
+}
+
+static void on_pomo_alert_tap(lv_event_t *e)
+{
+    (void)e;
+    pomo_stop_alert();
+}
+
+static void build_pomodoro(lv_obj_t *face)
+{
+    const lv_font_t *font = caption_font();
+    s_pomo_panel = lv_obj_create(face);
+    lv_obj_remove_style_all(s_pomo_panel);
+    lv_obj_remove_flag(s_pomo_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_pomo_panel, 344, 372);
+    lv_obj_center(s_pomo_panel);
+    lv_obj_set_style_bg_color(s_pomo_panel, lv_color_hex(COLOR_CARD_BG), 0);
+    lv_obj_set_style_bg_opa(s_pomo_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_pomo_panel, 24, 0);
+    lv_obj_add_flag(s_pomo_panel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *title = make_label(s_pomo_panel, font, COLOR_LIT);
+    lv_label_set_text(title, "ポモドーロ");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+    /* みゃおっち rides along small: the face's own rendered image,
+     * shared and scaled down — its expression follows the phase
+     * through the frame tick's pose override, nothing of its own. */
+    lv_obj_t *mini = lv_image_create(s_pomo_panel);
+    lv_image_set_src(mini, &s_muse_src);
+    lv_image_set_scale(mini, 72);
+    lv_obj_align(mini, LV_ALIGN_TOP_MID, 0, 40);
+    s_pomo_time = make_label(s_pomo_panel, FONT_CLOCK, 0xffffff);
+    lv_label_set_text(s_pomo_time, "25:00");
+    lv_obj_align(s_pomo_time, LV_ALIGN_TOP_MID, 0, 146);
+    s_pomo_state = make_label(s_pomo_panel, font, COLOR_DIM);
+    lv_obj_align(s_pomo_state, LV_ALIGN_TOP_MID, 0, 222);
+    s_pomo_dots = make_label(s_pomo_panel, font, COLOR_ACCENT);
+    lv_obj_align(s_pomo_dots, LV_ALIGN_TOP_MID, 0, 248);
+    lv_obj_t *main_btn = timer_button(s_pomo_panel, "スタート", on_pomo_main, NULL, &s_pomo_main_lbl);
+    lv_obj_set_size(main_btn, 150, 50);
+    lv_obj_align(main_btn, LV_ALIGN_TOP_MID, -80, 272);
+    s_pomo_skip_btn = timer_button(s_pomo_panel, "スキップ", on_pomo_skip, NULL, NULL);
+    lv_obj_set_size(s_pomo_skip_btn, 150, 50);
+    lv_obj_align(s_pomo_skip_btn, LV_ALIGN_TOP_MID, 80, 272);
+    s_pomo_end_btn = timer_button(s_pomo_panel, "終了", on_pomo_end, NULL, NULL);
+    lv_obj_set_size(s_pomo_end_btn, 104, 36);
+    lv_obj_align(s_pomo_end_btn, LV_ALIGN_TOP_MID, -56, 330);
+    lv_obj_t *close = timer_button(s_pomo_panel, "閉じる", on_pomo_close, NULL, NULL);
+    lv_obj_set_size(close, 104, 36);
+    lv_obj_align(close, LV_ALIGN_TOP_MID, 56, 330);
+    pomo_refresh(true);
+
+    /* The phase-end alert, the timer alert's shape: the ended phase
+     * named big, what comes next under it, a tap starts that next
+     * phase (pomo_stop_alert). */
+    s_pomo_alert = lv_obj_create(face);
+    lv_obj_remove_style_all(s_pomo_alert);
+    lv_obj_remove_flag(s_pomo_alert, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_pomo_alert, 360, 236);
+    lv_obj_center(s_pomo_alert);
+    lv_obj_set_style_bg_color(s_pomo_alert, lv_color_hex(COLOR_CARD_BG), 0);
+    lv_obj_set_style_bg_opa(s_pomo_alert, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_pomo_alert, 24, 0);
+    lv_obj_set_style_border_width(s_pomo_alert, 3, 0);
+    lv_obj_set_style_border_color(s_pomo_alert, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_add_flag(s_pomo_alert, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_pomo_alert, on_pomo_alert_tap, LV_EVENT_CLICKED, NULL);
+    s_pomo_alert_title = make_label(s_pomo_alert, font, COLOR_LIT);
+    lv_obj_set_style_transform_scale_x(s_pomo_alert_title, 512, 0);
+    lv_obj_set_style_transform_scale_y(s_pomo_alert_title, 512, 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_alert_title, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_alert_title, lv_pct(50), 0);
+    int title_pad = lv_font_get_line_height(font) / 2;
+    lv_obj_set_style_pad_top(s_pomo_alert_title, title_pad, 0);
+    lv_obj_set_style_pad_bottom(s_pomo_alert_title, title_pad, 0);
+    lv_obj_align(s_pomo_alert_title, LV_ALIGN_TOP_MID, 0, 26);
+    s_pomo_alert_sub = make_label(s_pomo_alert, font, COLOR_LIT);
+    lv_obj_set_size(s_pomo_alert_sub, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_pomo_alert_sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_pomo_alert_sub, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_t *hint = make_label(s_pomo_alert, font, COLOR_DIM);
+    lv_label_set_text(hint, "タップで次へ");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_obj_add_flag(s_pomo_alert, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_pomodoro(float now)
+{
+    if (!s_pomo_panel) {
+        return;
+    }
+    if (s_pomo.arm_pending) {   /* a session restored at load re-arms here */
+        s_pomo.arm_pending = false;
+        if (s_pomo_end_us) {
+            pomo_arm();
+        }
+    }
+    /* Open requests: the face comes forward and the panel opens. */
+    while (s_pomo_open_done != s_pomo_open_reqs) {
+        s_pomo_open_done++;
+        if (s_tv && s_face) {
+            lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+        }
+        care_close_panel();
+        timer_close_panel();
+        s_pomo_open = true;
+        lv_obj_remove_flag(s_pomo_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_pomo_panel);
+        pomo_refresh(true);
+    }
+    /* The esp_timer fired while the frame tick slept: the alert. The
+     * phase has already advanced on paper; it starts when the alert
+     * is stopped (pomo_stop_alert), by tap or by its deadline. */
+    if (s_pomo_fired) {
+        s_pomo_fired = false;
+        int ended = s_pomo.phase;
+        pomo_advance();
+        s_pomo.end_us = 0;
+        s_pomo.paused = false;
+        s_pomo_alert_ended = ended;
+        if (s_tv && s_face) {
+            lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+        }
+        care_close_panel();
+        timer_close_panel();
+        pomo_close_panel();
+        lv_label_set_text(s_pomo_alert_title,
+                          ended == POMO_FOCUS ? "集中おわり"
+                          : ended == POMO_LONG ? "長い休憩おわり" : "休憩おわり");
+        char sub[80];
+        if (ended == POMO_FOCUS) {
+            snprintf(sub, sizeof(sub), "%dセット目おわり　次は%s %d分",
+                     s_pomo.done, pomo_name(s_pomo.phase), pomo_len_s(s_pomo.phase) / 60);
+        } else {
+            snprintf(sub, sizeof(sub), "次は集中 %d分（%dセット目）",
+                     s_pomo.focus_min, s_pomo.done + 1);
+        }
+        lv_label_set_text(s_pomo_alert_sub, sub);
+        lv_obj_remove_flag(s_pomo_alert, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_pomo_alert);
+        s_pomo_alert_until = now + 30.0f;
+        s_pomo_alert_last = 0;
+        pomo_save();
+    }
+    if (s_pomo_alert_until > 0) {
+        if (now >= s_pomo_alert_until) {
+            pomo_stop_alert();   /* unstopped alerts still advance the chain */
+        } else {
+            /* A focus ending insists (two chirps, a 1.2 s beat); a
+             * break ending is gentler (one chirp, a 2.4 s beat). */
+            float beat = s_pomo_alert_ended == POMO_FOCUS ? 1.2f : 2.4f;
+            if (now - s_pomo_alert_last >= beat) {
+                s_pomo_alert_last = now;
+                int mode = muse_settings_sound_mode();
+                if (mode != MUSE_SOUND_OFF) {
+                    muse_review_pulse();   /* the motor, in the modes that have it */
+                }
+                if (mode == MUSE_SOUND_ON) {
+                    muse_voice_request_chirp();   /* a chirp, never speech */
+                    if (s_pomo_alert_ended == POMO_FOCUS) {
+                        muse_voice_request_chirp();
+                    }
+                }
+            }
+        }
+    }
+    if (s_pomo_open) {
+        pomo_refresh(false);
+    }
+    /* The clock face's remaining-time row, shared with the timer:
+     * update_timer() runs first and owns the row while it counts, so
+     * the pomodoro writes only when the timer is idle. */
+    if (s_clock_timer && timer_left_s() < 0) {
+        char buf[48] = "";
+        if (s_pomo_alert_until > 0) {
+            char t[16];
+            timer_fmt(t, sizeof(t), pomo_len_s(s_pomo.phase));
+            snprintf(buf, sizeof(buf), "%s %s", pomo_name(s_pomo.phase), t);
+        } else {
+            int left = pomo_left_s();
+            if (left >= 0) {
+                char t[16];
+                timer_fmt(t, sizeof(t), left);
+                snprintf(buf, sizeof(buf), "%s %s", pomo_name(s_pomo.phase), t);
+            }
+        }
+        if (strcmp(buf, lv_label_get_text(s_clock_timer)) != 0) {
+            lv_label_set_text(s_clock_timer, buf);
+        }
+        lv_obj_set_flag(s_clock_timer, LV_OBJ_FLAG_HIDDEN, !buf[0]);
+    }
+}
+
+/* Settings > Pomodoro (msw_pomodoro_ui.inc) reads and writes the
+ * lengths through here; a change mid-session lands at the next
+ * phase, whose length is read when it starts. */
+void muse_ui_pomodoro_config(muse_pomo_cfg_t *out)
+{
+    care_load();
+    out->focus_min = s_pomo.focus_min;
+    out->break_min = s_pomo.break_min;
+    out->long_min = s_pomo.long_min;
+    out->sets = s_pomo.sets;
+}
+
+void muse_ui_set_pomodoro_config(const muse_pomo_cfg_t *cfg)
+{
+    care_load();
+    s_pomo.focus_min = cfg->focus_min < 1 ? 1 : cfg->focus_min > 180 ? 180 : cfg->focus_min;
+    s_pomo.break_min = cfg->break_min < 1 ? 1 : cfg->break_min > 60 ? 60 : cfg->break_min;
+    s_pomo.long_min = cfg->long_min < 1 ? 1 : cfg->long_min > 90 ? 90 : cfg->long_min;
+    s_pomo.sets = cfg->sets < 2 ? 2 : cfg->sets > 8 ? 8 : cfg->sets;
+    if (s_pomo.done > s_pomo.sets) {
+        s_pomo.done = s_pomo.sets;
+    }
+    pomo_save();
+    if (s_pomo_panel) {
+        pomo_refresh(true);
     }
 }
 
@@ -3001,7 +3620,253 @@ static void render_dash(void)
         lv_obj_set_pos(none, 10, 0);
     }
     if (root) {
+        trains_consider(root);   /* dev.22: cache a new timetable, if this edition carries one */
         cJSON_Delete(root);
+    }
+}
+
+/*
+ * dev.22: the next train — the watch side. The edition may carry a
+ * "trains" block (the schema is in work/development-status.md's
+ * dev.22 entry): one station, one direction, three day-type tables
+ * of departure minutes, the walk minutes to the platform, and the
+ * day types the edition asserts for today and tomorrow (holidays are
+ * Muse's to know; the watch only knows weekdays). render_dash()
+ * hands each new edition here; a block that validates replaces the
+ * NVS cache (in the care handle, beside the pomodoro), and from then
+ * on the countdown is pure RTC arithmetic in trains_line() — no
+ * fetch, no polling, and an edition without the block (or no edition
+ * at all yet) simply leaves the cache standing. The railway day runs
+ * from 03:00: earlier than that, the small hours still belong to
+ * yesterday's table, whose entries run past 1440 to 25:59.
+ */
+typedef struct {
+    uint8_t v, walk, dt_today, dt_tom;
+    char date[11];
+    uint8_t n[3];
+    uint16_t mins[3][TRAINS_MAX];
+} trains_blob_t;
+
+static uint32_t trains_hash(const trains_blob_t *b)
+{
+    const uint8_t *p = (const uint8_t *)b;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < sizeof(*b); i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+}
+
+static void trains_load(void)
+{
+    if (s_trains.loaded) {
+        return;
+    }
+    s_trains.loaded = true;
+    care_load();   /* opens the shared NVS handle */
+    if (!s_care_nvs) {
+        return;
+    }
+    trains_blob_t blob;
+    size_t len = sizeof(blob);
+    if (nvs_get_blob(s_care_nvs, "trains", &blob, &len) != ESP_OK || len != sizeof(blob)
+        || blob.v != 1) {
+        return;
+    }
+    for (int t = 0; t < 3; t++) {
+        if (blob.n[t] > TRAINS_MAX) {
+            return;
+        }
+    }
+    s_trains.present = true;
+    s_trains.walk = blob.walk <= 30 ? blob.walk : 0;
+    snprintf(s_trains.date, sizeof(s_trains.date), "%s", blob.date);
+    s_trains.dt_today = blob.dt_today <= 2 ? blob.dt_today : 0;
+    s_trains.dt_tom = blob.dt_tom <= 2 ? blob.dt_tom : 0;
+    for (int t = 0; t < 3; t++) {
+        s_trains.n[t] = blob.n[t];
+        memcpy(s_trains.mins[t], blob.mins[t], sizeof(blob.mins[t]));
+    }
+    s_trains.hash = trains_hash(&blob);
+}
+
+static void trains_consider(cJSON *root)
+{
+    cJSON *tr = cJSON_GetObjectItemCaseSensitive(root, "trains");
+    if (!cJSON_IsObject(tr)) {
+        return;   /* an edition without the block leaves the cache standing */
+    }
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(tr, "v");
+    if (!cJSON_IsNumber(v) || v->valueint != 1) {
+        return;
+    }
+    trains_blob_t blob;
+    memset(&blob, 0, sizeof(blob));
+    blob.v = 1;
+    cJSON *walk = cJSON_GetObjectItemCaseSensitive(tr, "walk");
+    blob.walk = cJSON_IsNumber(walk) && walk->valueint >= 0 && walk->valueint <= 30
+                    ? (uint8_t)walk->valueint : 0;
+    static const char *const KEYS[3] = { "wd", "sat", "hol" };
+    for (int t = 0; t < 3; t++) {
+        cJSON *arr = cJSON_GetObjectItemCaseSensitive(tr, KEYS[t]);
+        if (!cJSON_IsArray(arr)) {
+            return;   /* all three tables, or the block is not trusted */
+        }
+        int n = cJSON_GetArraySize(arr);
+        if (n > TRAINS_MAX) {
+            n = TRAINS_MAX;
+        }
+        for (int i = 0; i < n; i++) {
+            cJSON *m = cJSON_GetArrayItem(arr, i);
+            if (!cJSON_IsNumber(m) || m->valueint < 0 || m->valueint > 1500) {
+                return;
+            }
+            blob.mins[t][i] = (uint16_t)m->valueint;
+        }
+        blob.n[t] = (uint8_t)n;
+    }
+    cJSON *days = cJSON_GetObjectItemCaseSensitive(tr, "days");
+    if (cJSON_IsObject(days)) {
+        cJSON *date = cJSON_GetObjectItemCaseSensitive(days, "date");
+        cJSON *today = cJSON_GetObjectItemCaseSensitive(days, "today");
+        cJSON *tom = cJSON_GetObjectItemCaseSensitive(days, "tomorrow");
+        if (cJSON_IsString(date) && strlen(date->valuestring) == 10
+            && cJSON_IsNumber(today) && today->valueint >= 0 && today->valueint <= 2
+            && cJSON_IsNumber(tom) && tom->valueint >= 0 && tom->valueint <= 2) {
+            snprintf(blob.date, sizeof(blob.date), "%s", date->valuestring);
+            blob.dt_today = (uint8_t)today->valueint;
+            blob.dt_tom = (uint8_t)tom->valueint;
+        }
+    }
+    trains_load();
+    uint32_t h = trains_hash(&blob);
+    if (s_trains.present && h == s_trains.hash) {
+        return;   /* the same timetable again: no NVS wear */
+    }
+    s_trains.present = true;
+    s_trains.walk = blob.walk;
+    snprintf(s_trains.date, sizeof(s_trains.date), "%s", blob.date);
+    s_trains.dt_today = blob.dt_today;
+    s_trains.dt_tom = blob.dt_tom;
+    for (int t = 0; t < 3; t++) {
+        s_trains.n[t] = blob.n[t];
+        memcpy(s_trains.mins[t], blob.mins[t], sizeof(blob.mins[t]));
+    }
+    s_trains.hash = h;
+    if (s_care_nvs) {
+        nvs_set_blob(s_care_nvs, "trains", &blob, sizeof(blob));
+        nvs_commit(s_care_nvs);
+    }
+}
+
+/* The day type for one date: the edition's flags when they name the
+ * date (or the day after their date), else the weekday's own type —
+ * the fallback for a stale edition, which still gets Saturdays and
+ * Sundays right and only misses holidays. */
+static int trains_type_for(const struct tm *d)
+{
+    if (s_trains.date[0]) {
+        char dwant[16];
+        snprintf(dwant, sizeof(dwant), "%04d-%02d-%02d",
+                 d->tm_year + 1900, d->tm_mon + 1, d->tm_mday);
+        if (!strcmp(dwant, s_trains.date)) {
+            return s_trains.dt_today;
+        }
+        /* The flags' tomorrow: the day after their date. */
+        struct tm base = { 0 };
+        int y, mo, da;
+        if (sscanf(s_trains.date, "%d-%d-%d", &y, &mo, &da) == 3) {
+            base.tm_year = y - 1900;
+            base.tm_mon = mo - 1;
+            base.tm_mday = da + 1;   /* mktime normalises the overflow */
+            base.tm_isdst = -1;
+            struct tm next;
+            time_t tt = mktime(&base);
+            if (tt != (time_t)-1 && localtime_r(&tt, &next)) {
+                char nwant[16];
+                snprintf(nwant, sizeof(nwant), "%04d-%02d-%02d",
+                         next.tm_year + 1900, next.tm_mon + 1, next.tm_mday);
+                if (!strcmp(dwant, nwant)) {
+                    return s_trains.dt_tom;
+                }
+            }
+        }
+    }
+    return d->tm_wday == 0 ? 2 : d->tm_wday == 6 ? 1 : 0;
+}
+
+/* The clock face's train line: "電車 あと9分 7:42発 次7:53", or, once
+ * the railway day's last train has gone, "電車 本日終了 始発 5:12".
+ * The countdown is to leaving home (departure minus the walk) when
+ * the edition set walk minutes; the 発 time is always the train's. */
+static void trains_line(char *buf, size_t cap, const struct tm *local, bool have_time)
+{
+    buf[0] = '\0';
+    trains_load();
+    if (!have_time || !s_trains.present) {
+        return;
+    }
+    struct tm d = *local;
+    int now_min = local->tm_hour * 60 + local->tm_min;
+    int rel = now_min;
+    if (now_min < 180) {   /* before 03:00: still yesterday's railway day */
+        time_t tt = mktime(&d);
+        if (tt == (time_t)-1) {
+            return;
+        }
+        tt -= 86400;
+        if (!localtime_r(&tt, &d)) {
+            return;
+        }
+        rel = now_min + 1440;
+    }
+    int type = trains_type_for(&d);
+    const uint16_t *tab = s_trains.mins[type];
+    int n = s_trains.n[type];
+    int first = -1, second = -1;
+    for (int i = 0; i < n; i++) {
+        if (tab[i] > rel) {
+            first = tab[i];
+            if (i + 1 < n) {
+                second = tab[i + 1];
+            }
+            break;
+        }
+    }
+    bool next_day = false;
+    if (first < 0) {   /* the day's trains are done: tomorrow's first */
+        struct tm d2 = d;
+        time_t tt = mktime(&d2);
+        if (tt == (time_t)-1) {
+            return;
+        }
+        tt += 86400;
+        if (!localtime_r(&tt, &d2)) {
+            return;
+        }
+        int type2 = trains_type_for(&d2);
+        if (s_trains.n[type2] > 0) {
+            first = s_trains.mins[type2][0] + 1440;
+            next_day = true;
+        }
+    }
+    if (first < 0) {
+        return;   /* no timetable at all */
+    }
+    int dep_h = (first / 60) % 24, dep_m = first % 60;
+    if (next_day) {
+        snprintf(buf, cap, "電車 本日終了 始発 %d:%02d", dep_h, dep_m);
+        return;
+    }
+    int away = first - rel - s_trains.walk;
+    if (away < 0) {
+        away = 0;
+    }
+    if (second >= 0) {
+        snprintf(buf, cap, "電車 あと%d分 %d:%02d発 次%d:%02d",
+                 away, dep_h, dep_m, (second / 60) % 24, second % 60);
+    } else {
+        snprintf(buf, cap, "電車 あと%d分 %d:%02d発", away, dep_h, dep_m);
     }
 }
 
@@ -3716,6 +4581,7 @@ static void build_screen(void)
     build_care(face);    /* dev.14: the care panel, food and accessories */
     build_clock(face);   /* dev.14: the yellow button's clock face */
     build_timer(face);   /* dev.16: the countdown timer panel and its alert */
+    build_pomodoro(face);   /* dev.22: the pomodoro panel and its alert */
 #endif
 }
 
@@ -4617,6 +5483,7 @@ static void frame_tick(lv_timer_t *timer)
     update_face_mode();   /* dev.14: yellow-button presses, the clock face */
     update_care(now);     /* dev.14: care meters, food, accessories, growth */
     update_timer(now);    /* dev.16: timer opens, the fired alert, the clock row */
+    update_pomodoro(now);   /* dev.22: pomodoro opens, the fired alert, the shared clock row */
 #endif
     if (s_tv && lv_obj_get_scroll_x(s_tv) != face_scroll_x()) {
         /* Off screen, or sliding to or from settings: hold still so the
@@ -4654,6 +5521,13 @@ static void frame_tick(lv_timer_t *timer)
             pose.mode = MUSE_MODE_OFF;
             pose.mode_t = 0.7f;
         }
+    }
+    /* dev.22: while the pomodoro panel is up, みゃおっち follows the
+     * phase instead — calm (no happy mixed in) through a focus, fully
+     * happy on a break. Expression only: the care meters above are
+     * neither consulted nor changed for it. */
+    if (mode == MUSE_MODE_IDLE && s_pomo_open && s_pomo.phase != POMO_IDLE) {
+        pose.happy = s_pomo.phase == POMO_FOCUS ? 0.0f : 1.0f;
     }
 #endif
     bool render = !muse_board->epaper || mode != s_last_epaper_pose;

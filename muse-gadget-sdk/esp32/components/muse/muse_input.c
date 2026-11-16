@@ -712,6 +712,12 @@ static void yellow_long_press(void)
         break;
     case MUSE_YEL_LONG_NONE:
         break;
+    case MUSE_YEL_LONG_POMODORO:   /* dev.22 */
+        muse_ui_request_pomodoro();
+        if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+            muse_state_set_hint("POMODORO");
+        }
+        break;
     default:   /* MUSE_YEL_LONG_TIMER, the default */
         muse_ui_request_timer();
         if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {

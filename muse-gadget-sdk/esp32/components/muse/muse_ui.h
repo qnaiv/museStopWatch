@@ -53,10 +53,23 @@ void muse_ui_request_timer(void);
 /* museStopWatch dev.16: the yellow button's long-press assignment
  * (Settings > Yellow button), kept in NVS across reboots. A short press
  * always switches the face (dev.14); only the hold is assignable. */
-enum { MUSE_YEL_LONG_TIMER = 0, MUSE_YEL_LONG_APP = 1, MUSE_YEL_LONG_FACE = 2, MUSE_YEL_LONG_NONE = 3 };
+enum { MUSE_YEL_LONG_TIMER = 0, MUSE_YEL_LONG_APP = 1, MUSE_YEL_LONG_FACE = 2, MUSE_YEL_LONG_NONE = 3,
+       MUSE_YEL_LONG_POMODORO = 4 };   /* dev.22: appended, so stored 0..3 keep their meaning */
 int muse_ui_yellow_long_action(void);
 const char *muse_ui_yellow_long_app(void);   /* the app id for MUSE_YEL_LONG_APP */
 void muse_ui_set_yellow_long(int action, const char *app_id);
+/* museStopWatch dev.22: open the pomodoro panel (the quick tile's
+ * button, the launcher's built-in cell, the yellow button's long
+ * press). From any task, like muse_ui_request_timer(). */
+void muse_ui_request_pomodoro(void);
+/* museStopWatch dev.22: the pomodoro lengths (Settings > Pomodoro),
+ * kept in NVS across reboots. Minutes, and how many focus phases make
+ * a long break. Defaults 25 / 5 / 15 / 4. */
+typedef struct {
+    int focus_min, break_min, long_min, sets;
+} muse_pomo_cfg_t;
+void muse_ui_pomodoro_config(muse_pomo_cfg_t *out);
+void muse_ui_set_pomodoro_config(const muse_pomo_cfg_t *cfg);
 /* museStopWatch dev.17: ask for the battery history to be uploaded to the
  * VM (workspace/battery_history.json) so Muse can analyse it. Cheap to
  * call often (the Battery page's tick does): it starts nothing while an

@@ -1781,6 +1781,7 @@ static void build_power_page(lv_obj_t *tile)
 #include "msw_wake_ui.inc"        /* museStopWatch: Settings > Wake word */
 #include "msw_avatar_ui.inc"      /* museStopWatch: Settings > Avatar */
 #include "msw_yellow_ui.inc"      /* museStopWatch: Settings > Yellow button (dev.16) */
+#include "msw_pomodoro_ui.inc"    /* museStopWatch: Settings > Pomodoro (dev.22) */
 
 /* ---------- Home ---------- */
 
@@ -1823,6 +1824,7 @@ static void build_home(lv_obj_t *tile)
     }
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     row(list, LV_SYMBOL_LIST, "Yellow button", &s_home_yellow, on_nav, (void *)&MSW_YELLOW);   /* dev.16 */
+    row(list, LV_SYMBOL_BELL, "Pomodoro", &s_home_pomo, on_nav, (void *)&MSW_POMODORO);   /* dev.22 */
 #endif
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
@@ -1979,6 +1981,8 @@ void muse_settings_ui_tick(bool visible)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     else if (s_yellow_pg && s_current == s_yellow_pg) {   /* museStopWatch dev.16 */
         msw_tick_yellow();
+    } else if (s_pomo_pg && s_current == s_pomo_pg) {   /* museStopWatch dev.22 */
+        msw_tick_pomodoro();
     }
 #endif
     else {

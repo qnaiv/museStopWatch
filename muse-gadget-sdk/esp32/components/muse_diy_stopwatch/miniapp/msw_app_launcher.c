@@ -226,6 +226,55 @@ static lv_obj_t *timer_cell(lv_obj_t *parent)
     return c;
 }
 
+/* dev.22: the built-in pomodoro sits beside the timer, the same
+ * shape — firmware, not an app; a tap opens its panel on the face. */
+static void on_pomo_tap(lv_event_t *e)
+{
+    (void)e;
+    if (s_info) {
+        return;
+    }
+    muse_ui_request_pomodoro();
+}
+
+static lv_obj_t *pomo_cell(lv_obj_t *parent)
+{
+    lv_obj_t *c = lv_obj_create(parent);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_size(c, CELL, CELL + 8);
+    lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(c, on_pomo_tap, LV_EVENT_SHORT_CLICKED, NULL);
+
+    lv_obj_t *ring = lv_obj_create(c);
+    lv_obj_remove_style_all(ring);
+    lv_obj_set_size(ring, ICON_D, ICON_D);
+    lv_obj_align(ring, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ring, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(ring, lv_color_hex(0xC62828), 0);
+    lv_obj_set_style_border_width(ring, 2, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(0x4A5868), 0);
+    lv_obj_set_style_bg_color(ring, lv_color_hex(0x3A4858), LV_STATE_PRESSED);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ring, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_style_clip_corner(ring, true, 0);
+    lv_obj_t *l = lv_label_create(ring);
+    lv_obj_set_style_text_font(l, msw_font_cjk(&lv_font_montserrat_20), 0);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_label_set_text(l, "ポ");
+    lv_obj_center(l);
+    lv_obj_t *name = lv_label_create(c);
+    lv_obj_set_width(name, CELL);
+    lv_obj_set_style_text_font(name, jp(), 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(0xD0D8E0), 0);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_label_set_text(name, "ポモドーロ");
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, ICON_D + 4);
+    return c;
+}
+
 static void free_items(void)
 {
     for (int i = 0; i < s_nitems; i++) {
@@ -319,6 +368,7 @@ static void rebuild(void)
     }
     s_nitems = n;
     timer_cell(s_grid);   /* dev.16: the built-in timer always leads */
+    pomo_cell(s_grid);    /* dev.22: the built-in pomodoro beside it */
     for (int i = 0; i < n; i++) {
         cell(s_grid, &s_items[i], i);
     }
