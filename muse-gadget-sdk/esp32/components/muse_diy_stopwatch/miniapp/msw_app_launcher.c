@@ -177,8 +177,10 @@ static void on_hold(lv_event_t *e)
 
 /* dev.16: the built-in countdown timer leads the grid. It is firmware,
  * not an installed app — no details panel, nothing to remove — and a
- * tap opens the timer screen on Muse's face (muse_ui.c). Drawn like
- * an app with no icon: its name's first character in a coloured ring. */
+ * tap opens the timer screen on Muse's face (muse_ui.c). dev.23: the
+ * tap opens the unified timer/pomodoro panel, and the cell's icon is
+ * a stopwatch drawn from plain objects (below), not the name's first
+ * character. */
 static void on_timer_tap(lv_event_t *e)
 {
     (void)e;
@@ -186,6 +188,53 @@ static void on_timer_tap(lv_event_t *e)
         return;
     }
     muse_ui_request_timer();
+}
+
+/* One piece of the timer cell's stopwatch glyph: a plain filled
+ * object in the ring, positioned in ring coordinates (the ring is
+ * ICON_D square). Clicks bubble to the cell, like the ring's own. */
+static lv_obj_t *glyph_part(lv_obj_t *ring, int w, int h, int x, int y, int radius)
+{
+    lv_obj_t *o = lv_obj_create(ring);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_style_radius(o, radius, 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(o, lv_color_white(), 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(o, LV_OBJ_FLAG_EVENT_BUBBLE);
+    return o;
+}
+
+/* dev.23: the stopwatch glyph, in the 84 px ring. A white outline
+ * face (50 px, centred a little low at (42, 48) so the crown clears
+ * the ring's curve), the crown and its stem on top, two hands — the
+ * minute hand straight up, the hour hand a short bar rotated about
+ * the centre to point at half past four — and the centre dot over
+ * their pivots. All white on the ring's amber, the pictogram weight
+ * of the app icons' glyphs beside it. */
+static void timer_glyph(lv_obj_t *ring)
+{
+    lv_obj_t *face = lv_obj_create(ring);
+    lv_obj_remove_style_all(face);
+    lv_obj_set_size(face, 50, 50);
+    lv_obj_set_pos(face, 17, 23);
+    lv_obj_set_style_radius(face, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(face, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(face, 5, 0);
+    lv_obj_set_style_border_color(face, lv_color_white(), 0);
+    lv_obj_remove_flag(face, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(face, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    glyph_part(ring, 22, 10, 31, 9, 4);    /* the crown */
+    glyph_part(ring, 6, 10, 39, 16, 2);    /* its stem, crown to face */
+    glyph_part(ring, 5, 18, 40, 30, 2);    /* the minute hand, up */
+    lv_obj_t *hour = glyph_part(ring, 5, 15, 40, 33, 2);
+    lv_obj_set_style_transform_pivot_x(hour, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(hour, lv_pct(100), 0);
+    lv_obj_set_style_transform_rotation(hour, 1350, 0);   /* down-right */
+    glyph_part(ring, 10, 10, 37, 43, LV_RADIUS_CIRCLE);   /* the centre dot */
 }
 
 static lv_obj_t *timer_cell(lv_obj_t *parent)
@@ -210,11 +259,7 @@ static lv_obj_t *timer_cell(lv_obj_t *parent)
     lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(ring, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_clip_corner(ring, true, 0);
-    lv_obj_t *l = lv_label_create(ring);
-    lv_obj_set_style_text_font(l, msw_font_cjk(&lv_font_montserrat_20), 0);
-    lv_obj_set_style_text_color(l, lv_color_white(), 0);
-    lv_label_set_text(l, "タ");
-    lv_obj_center(l);
+    timer_glyph(ring);
     lv_obj_t *name = lv_label_create(c);
     lv_obj_set_width(name, CELL);
     lv_obj_set_style_text_font(name, jp(), 0);
@@ -222,55 +267,6 @@ static lv_obj_t *timer_cell(lv_obj_t *parent)
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     lv_label_set_text(name, "タイマー");
-    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, ICON_D + 4);
-    return c;
-}
-
-/* dev.22: the built-in pomodoro sits beside the timer, the same
- * shape — firmware, not an app; a tap opens its panel on the face. */
-static void on_pomo_tap(lv_event_t *e)
-{
-    (void)e;
-    if (s_info) {
-        return;
-    }
-    muse_ui_request_pomodoro();
-}
-
-static lv_obj_t *pomo_cell(lv_obj_t *parent)
-{
-    lv_obj_t *c = lv_obj_create(parent);
-    lv_obj_remove_style_all(c);
-    lv_obj_set_size(c, CELL, CELL + 8);
-    lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_event_cb(c, on_pomo_tap, LV_EVENT_SHORT_CLICKED, NULL);
-
-    lv_obj_t *ring = lv_obj_create(c);
-    lv_obj_remove_style_all(ring);
-    lv_obj_set_size(ring, ICON_D, ICON_D);
-    lv_obj_align(ring, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(ring, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(ring, lv_color_hex(0xC62828), 0);
-    lv_obj_set_style_border_width(ring, 2, 0);
-    lv_obj_set_style_border_color(ring, lv_color_hex(0x4A5868), 0);
-    lv_obj_set_style_bg_color(ring, lv_color_hex(0x3A4858), LV_STATE_PRESSED);
-    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ring, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_set_style_clip_corner(ring, true, 0);
-    lv_obj_t *l = lv_label_create(ring);
-    lv_obj_set_style_text_font(l, msw_font_cjk(&lv_font_montserrat_20), 0);
-    lv_obj_set_style_text_color(l, lv_color_white(), 0);
-    lv_label_set_text(l, "ポ");
-    lv_obj_center(l);
-    lv_obj_t *name = lv_label_create(c);
-    lv_obj_set_width(name, CELL);
-    lv_obj_set_style_text_font(name, jp(), 0);
-    lv_obj_set_style_text_color(name, lv_color_hex(0xD0D8E0), 0);
-    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_label_set_text(name, "ポモドーロ");
     lv_obj_align(name, LV_ALIGN_TOP_MID, 0, ICON_D + 4);
     return c;
 }
@@ -367,8 +363,9 @@ static void rebuild(void)
         }
     }
     s_nitems = n;
-    timer_cell(s_grid);   /* dev.16: the built-in timer always leads */
-    pomo_cell(s_grid);    /* dev.22: the built-in pomodoro beside it */
+    timer_cell(s_grid);   /* dev.16: the built-in timer always leads;
+                           * dev.23: it opens the unified panel, and the
+                           * pomodoro's own cell (dev.22) is gone */
     for (int i = 0; i < n; i++) {
         cell(s_grid, &s_items[i], i);
     }

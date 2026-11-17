@@ -27,27 +27,29 @@ extern int msw_app_list(struct msw_yellow_app_info *out, int max) __attribute__(
 static lv_obj_t *s_yellow_pg, *s_home_yellow;
 static lv_obj_t *s_yellow_checks[MSW_YELLOW_PAGE_MAX + 4];
 static struct msw_yellow_app_info s_yellow_infos[MSW_YELLOW_PAGE_MAX];
-static int s_yellow_rows;   /* option rows built: 4 fixed, then the apps */
+static int s_yellow_rows;   /* option rows built: 3 fixed, then the apps */
 static int s_yellow_apps;   /* how many of the rows are apps */
 
-/* One option row's action, by row: 0 the timer, 1 the pomodoro
- * (dev.22), 2 the face switch, 3 none, 4+i app i. A stored app that
- * has since been removed falls back to showing the timer — muse_ui
+/* One option row's action, by row: 0 the timer, 1 the face switch,
+ * 2 none, 3+i app i. dev.23: the pomodoro row (dev.22) is gone —
+ * the timer door opens the unified panel — and a stored pomodoro
+ * assignment checks the timer row instead (its long press still
+ * opens the panel, on the pomodoro tab). A stored app that has
+ * since been removed falls back to showing the timer — muse_ui
  * still holds its id, and the long press then just fails to start
  * it; picking any row rewrites the assignment cleanly. */
 static int msw_yellow_current(void)
 {
     int act = muse_ui_yellow_long_action();
-    if (act == MUSE_YEL_LONG_POMODORO) return 1;
-    if (act == MUSE_YEL_LONG_FACE) return 2;
-    if (act == MUSE_YEL_LONG_NONE) return 3;
+    if (act == MUSE_YEL_LONG_FACE) return 1;
+    if (act == MUSE_YEL_LONG_NONE) return 2;
     if (act == MUSE_YEL_LONG_APP) {
         const char *id = muse_ui_yellow_long_app();
         for (int i = 0; i < s_yellow_apps; i++) {
-            if (!strcmp(id, s_yellow_infos[i].id)) return 4 + i;
+            if (!strcmp(id, s_yellow_infos[i].id)) return 3 + i;
         }
     }
-    return 0;
+    return 0;   /* the timer, and a stored pomodoro (dev.23) */
 }
 
 static void msw_tick_yellow(void)
@@ -64,13 +66,11 @@ static void msw_on_yellow_pick(lv_event_t *e)
     if (idx == 0) {
         muse_ui_set_yellow_long(MUSE_YEL_LONG_TIMER, "");
     } else if (idx == 1) {
-        muse_ui_set_yellow_long(MUSE_YEL_LONG_POMODORO, "");
-    } else if (idx == 2) {
         muse_ui_set_yellow_long(MUSE_YEL_LONG_FACE, "");
-    } else if (idx == 3) {
+    } else if (idx == 2) {
         muse_ui_set_yellow_long(MUSE_YEL_LONG_NONE, "");
     } else {
-        muse_ui_set_yellow_long(MUSE_YEL_LONG_APP, s_yellow_infos[idx - 4].id);
+        muse_ui_set_yellow_long(MUSE_YEL_LONG_APP, s_yellow_infos[idx - 3].id);
     }
     msw_tick_yellow();
 }
@@ -82,8 +82,6 @@ static void msw_build_yellow_page(lv_obj_t *tile)
     note(list, "長押し（1.5秒）の動作です。短押しは顔と時計の切替で固定です。");
     int r = 0;
     row(list, NULL, "タイマー", &s_yellow_checks[r], msw_on_yellow_pick, (void *)(intptr_t)r);
-    r++;
-    row(list, NULL, "ポモドーロ", &s_yellow_checks[r], msw_on_yellow_pick, (void *)(intptr_t)r);
     r++;
     row(list, NULL, "顔・時計の切替", &s_yellow_checks[r], msw_on_yellow_pick, (void *)(intptr_t)r);
     r++;

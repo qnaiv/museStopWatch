@@ -307,6 +307,12 @@ static bool s_timer_paused;
 static float s_timer_alert_until;        /* the alert overlay's deadline, frame time */
 static float s_timer_alert_last;         /* the last alert pulse/chirp, frame time */
 static int timer_left_s(void);           /* below update_care(); -1 while not counting */
+/* dev.23: the timer and the pomodoro share one panel, headed by a
+ * mode tab row on each panel object; s_tpanel_mode is the tab the
+ * unified doors reopen in (0 the timer, 1 the pomodoro), kept in
+ * the care NVS handle (tpanel_mode) across reboots. */
+static int s_tpanel_mode;
+static lv_obj_t *s_ttab_btn[2], *s_ttab_lbl[2];   /* the tabs on the timer panel, by mode */
 /* dev.22: the pomodoro (the section after update_timer()). A phase
  * chain on the timer's esp_timer pattern — 25 min focus, 5 min break,
  * a long break after 4 focuses, all Settings-tunable — with its state
@@ -324,6 +330,7 @@ static struct {
 } s_pomo = { .focus_min = 25, .break_min = 5, .long_min = 15, .sets = 4, .phase = POMO_IDLE };
 static lv_obj_t *s_pomo_panel, *s_pomo_time, *s_pomo_state, *s_pomo_dots, *s_pomo_main_lbl;
 static lv_obj_t *s_pomo_skip_btn, *s_pomo_end_btn;
+static lv_obj_t *s_ptab_btn[2], *s_ptab_lbl[2];   /* dev.23: the tabs on the pomodoro panel, by mode */
 static lv_obj_t *s_pomo_alert, *s_pomo_alert_title, *s_pomo_alert_sub;
 static bool s_pomo_open;
 static volatile int s_pomo_open_reqs;    /* muse_ui_request_pomodoro(), any task */
@@ -336,8 +343,12 @@ static float s_pomo_alert_last;          /* the last alert pulse/chirp, frame ti
 static int s_pomo_alert_ended;           /* the phase the live alert ended (POMO_*) */
 static void pomo_load(void);             /* the pomodoro section, below */
 static void pomo_save(void);             /* the pomodoro section, below */
+static void pomo_refresh(bool force);    /* the pomodoro section, below */
 static void pomo_close_panel(void);      /* the pomodoro section, below */
+static void pomo_open_panel(void);       /* the pomodoro section, below */
 static void pomo_end_session(void);      /* the pomodoro section, below */
+static void tpanel_set_mode(int mode);   /* dev.23: the pomodoro section, below */
+static void tpanel_sync_tabs(void);      /* dev.23: the pomodoro section, below */
 /* dev.16: the yellow button's long-press assignment (Settings > Yellow
  * button), in the care NVS handle beside face_mode. The action defaults
  * to the timer; the app id matters only for MUSE_YEL_LONG_APP. */
@@ -439,6 +450,7 @@ static void care_load(void)
         if (nvs_get_u32(s_care_nvs, "care_ts", &ts) == ESP_OK) s_care.anchor = ts;
         if (nvs_get_u8(s_care_nvs, "face_mode", &b) == ESP_OK) s_clock_mode = b != 0;
         if (nvs_get_u8(s_care_nvs, "yel_l_act", &b) == ESP_OK && b <= MUSE_YEL_LONG_POMODORO) s_yel_long_act = b;
+        if (nvs_get_u8(s_care_nvs, "tpanel_mode", &b) == ESP_OK && b <= 1) s_tpanel_mode = b;   /* dev.23 */
         size_t yn = sizeof(s_yel_long_app);
         if (nvs_get_str(s_care_nvs, "yel_l_app", s_yel_long_app, &yn) != ESP_OK) s_yel_long_app[0] = '\0';
     }
@@ -497,13 +509,15 @@ void muse_ui_set_yellow_long(int action, const char *app_id)
     }
 }
 
-/* dev.16: a timer-open request (any task); update_timer() applies it. */
+/* dev.16: a timer-open request (any task); update_timer() applies
+ * it — dev.23: in the unified panel's last-used mode. */
 void muse_ui_request_timer(void)
 {
     s_timer_open_reqs++;
 }
 
-/* dev.22: a pomodoro-open request (any task); update_pomodoro() applies it. */
+/* dev.22: a pomodoro-open request (any task); update_pomodoro()
+ * applies it — dev.23: the unified panel, on its pomodoro tab. */
 void muse_ui_request_pomodoro(void)
 {
     s_pomo_open_reqs++;
@@ -1787,13 +1801,6 @@ static void on_quick_timer(lv_event_t *e)
     muse_ui_request_timer();
 }
 
-/* dev.22: the pomodoro's door on this tile, beside the timer's. */
-static void on_quick_pomodoro(lv_event_t *e)
-{
-    (void)e;
-    muse_ui_request_pomodoro();
-}
-
 static lv_obj_t *quick_slider(lv_obj_t *tile, const lv_font_t *font, const char *name, int y,
                               int min, int max, int val, lv_event_cb_t cb, lv_obj_t **val_out)
 {
@@ -1843,17 +1850,15 @@ static void build_quick(lv_obj_t *tile)
         s_quick_snd[mode] = b;
         s_quick_snd_lbl[mode] = l;
     }
+    /* dev.23: two across, widened — the timer door opens the unified
+     * timer/pomodoro panel, so the pomodoro's own button (dev.22)
+     * left the row. */
     lv_obj_t *settings = hist_button(tile, font, "設定", on_quick_settings);
-    lv_obj_set_size(settings, 104, 48);
-    lv_obj_align(settings, LV_ALIGN_TOP_MID, -112, 356);
+    lv_obj_set_size(settings, 150, 48);
+    lv_obj_align(settings, LV_ALIGN_TOP_MID, -80, 356);
     lv_obj_t *timer = hist_button(tile, font, "タイマー", on_quick_timer);
-    lv_obj_set_size(timer, 104, 48);
-    lv_obj_align(timer, LV_ALIGN_TOP_MID, 0, 356);
-    /* dev.22: the pomodoro joins the row; three across at the sound
-     * buttons' width, so 設定 and タイマー narrow to match. */
-    lv_obj_t *pomo = hist_button(tile, font, "ポモドーロ", on_quick_pomodoro);
-    lv_obj_set_size(pomo, 104, 48);
-    lv_obj_align(pomo, LV_ALIGN_TOP_MID, 112, 356);
+    lv_obj_set_size(timer, 150, 48);
+    lv_obj_align(timer, LV_ALIGN_TOP_MID, 80, 356);
     lv_obj_t *hint = make_label(tile, font, COLOR_DIM);
     lv_label_set_text(hint, "上にスワイプでもどる");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -30);
@@ -2337,6 +2342,13 @@ static void update_care(float now)
  * repeats for up to 30 s; a tap on it, or the deadline, ends it. While
  * the timer counts, the clock face carries its remaining time as a
  * small row (update_timer, below).
+ *
+ * dev.23: this panel and the pomodoro's are one panel to the user —
+ * the same mode tab row heads both, a tab tap swaps which is shown,
+ * and every door (quick tile, launcher cell, yellow long press)
+ * opens through here or muse_ui_request_pomodoro() and lands on the
+ * last-used tab. The two state machines are untouched; only the
+ * presentation merged.
  */
 static void timer_fmt(char *buf, size_t cap, int secs)
 {
@@ -2399,10 +2411,45 @@ static void timer_close_panel(void)
     lv_obj_add_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* Bring the face forward and show the timer's side of the unified
+ * panel (the care panel and the pomodoro's side give way). The
+ * update_timer() open path and the pomodoro panel's timer tab both
+ * land here. */
+static void timer_open_panel(void)
+{
+    if (s_tv && s_face) {
+        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+    }
+    care_close_panel();
+    pomo_close_panel();
+    s_timer_open = true;
+    lv_obj_remove_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_timer_panel);
+    tpanel_sync_tabs();   /* dev.23: the stored mode is loaded by now */
+    timer_refresh(true);
+}
+
 static void on_timer_close(lv_event_t *e)
 {
     (void)e;
     timer_close_panel();
+}
+
+/* dev.23: a mode tab on either panel — swap the shown side and
+ * remember the tab, so the unified doors reopen where the user
+ * left it. Runs in the LVGL task, like every event callback. */
+static void on_tpanel_tab(lv_event_t *e)
+{
+    int mode = (int)(intptr_t)lv_event_get_user_data(e);
+    if (mode == s_tpanel_mode && (mode ? s_pomo_open : s_timer_open)) {
+        return;   /* already showing this tab */
+    }
+    tpanel_set_mode(mode);
+    if (mode) {
+        pomo_open_panel();
+    } else {
+        timer_open_panel();
+    }
 }
 
 static void on_timer_add(lv_event_t *e)
@@ -2472,6 +2519,21 @@ static lv_obj_t *timer_button(lv_obj_t *parent, const char *text, lv_event_cb_t 
     return b;
 }
 
+/* dev.23: the unified panel's mode tab row, built identically on
+ * both panel objects (they are the title now). The live tab is lit
+ * by tpanel_sync_tabs(), the quick tile's sound buttons' way. */
+static void tpanel_build_tabs(lv_obj_t *panel, lv_obj_t **btns, lv_obj_t **lbls)
+{
+    static const char *const NAMES[2] = { "タイマー", "ポモドーロ" };
+    for (int m = 0; m < 2; m++) {
+        lv_obj_t *b = timer_button(panel, NAMES[m], on_tpanel_tab,
+                                   (void *)(intptr_t)m, &lbls[m]);
+        lv_obj_set_size(b, 150, 38);
+        lv_obj_align(b, LV_ALIGN_TOP_MID, m ? 80 : -80, 10);
+        btns[m] = b;
+    }
+}
+
 static void build_timer(lv_obj_t *face)
 {
     const lv_font_t *font = caption_font();
@@ -2485,9 +2547,8 @@ static void build_timer(lv_obj_t *face)
     lv_obj_set_style_radius(s_timer_panel, 24, 0);
     lv_obj_add_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *title = make_label(s_timer_panel, font, COLOR_LIT);
-    lv_label_set_text(title, "タイマー");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    /* dev.23: the mode tabs head the panel, in the title's place. */
+    tpanel_build_tabs(s_timer_panel, s_ttab_btn, s_ttab_lbl);
     s_timer_time = make_label(s_timer_panel, FONT_CLOCK, 0xffffff);
     lv_label_set_text(s_timer_time, "3:00");
     lv_obj_align(s_timer_time, LV_ALIGN_TOP_MID, 0, 52);
@@ -2551,19 +2612,16 @@ static void update_timer(float now)
     if (!s_timer_panel) {
         return;
     }
-    /* Open requests: the face comes forward and the panel opens (the
-     * care panel gives way; a running timer keeps running). */
+    /* Open requests: the face comes forward and the unified panel
+     * opens (the care panel gives way; a running timer keeps
+     * running) — dev.23: on the last-used tab, whichever it is. */
     while (s_timer_open_done != s_timer_open_reqs) {
         s_timer_open_done++;
-        if (s_tv && s_face) {
-            lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+        if (s_tpanel_mode == 1) {
+            pomo_open_panel();
+        } else {
+            timer_open_panel();
         }
-        care_close_panel();
-        pomo_close_panel();
-        s_timer_open = true;
-        lv_obj_remove_flag(s_timer_panel, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_timer_panel);
-        timer_refresh(true);
     }
     /* The esp_timer fired while the frame tick slept: the alert. */
     if (s_timer_fired) {
@@ -2624,9 +2682,10 @@ static void update_timer(float now)
  * instead of one countdown: focus (25 min) → break (5 min), and a
  * long break (15 min) after 4 focuses, the lengths and the count
  * tunable in Settings > Pomodoro. It borrows the timer's whole shape:
- * a panel over the face reached three ways (the quick tile's
- * ポモドーロ button, the launcher's built-in cell, the yellow
- * button's long press) through muse_ui_request_pomodoro(); an
+ * a panel over the face reached through muse_ui_request_pomodoro()
+ * (dev.23: the yellow button's stored pomodoro assignment is the
+ * surviving door — the quick tile and the launcher now open the
+ * unified panel, whose pomodoro tab is this panel); an
  * esp_timer finish that lands while the watch sleeps, its callback
  * only flagging and waking; an alert update_pomodoro() raises on the
  * first frame back, sounded by the sound mode — pulses and chirps,
@@ -2797,6 +2856,64 @@ static void pomo_close_panel(void)
     }
 }
 
+/* Bring the face forward and show the pomodoro's side of the
+ * unified panel (dev.23; the timer's side is timer_open_panel()).
+ * The update_pomodoro() open path and the timer panel's pomodoro
+ * tab both land here. */
+static void pomo_open_panel(void)
+{
+    if (!s_pomo_panel) {
+        return;
+    }
+    if (s_tv && s_face) {
+        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
+    }
+    care_close_panel();
+    timer_close_panel();
+    s_pomo_open = true;
+    lv_obj_remove_flag(s_pomo_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_pomo_panel);
+    tpanel_sync_tabs();   /* dev.23: the stored mode is loaded by now */
+    pomo_refresh(true);
+}
+
+/* dev.23: light the live mode's tab on both panels, the quick
+ * tile's sound buttons' convention (accent bg, dark text). */
+static void tpanel_sync_tabs(void)
+{
+    lv_obj_t *btns[2][2] = { { s_ttab_btn[0], s_ttab_btn[1] }, { s_ptab_btn[0], s_ptab_btn[1] } };
+    lv_obj_t *lbls[2][2] = { { s_ttab_lbl[0], s_ttab_lbl[1] }, { s_ptab_lbl[0], s_ptab_lbl[1] } };
+    for (int p = 0; p < 2; p++) {
+        for (int m = 0; m < 2; m++) {
+            if (!btns[p][m]) {
+                continue;
+            }
+            bool on = s_tpanel_mode == m;
+            lv_obj_set_style_bg_color(btns[p][m], lv_color_hex(on ? COLOR_ACCENT : 0x241d40), 0);
+            if (lbls[p][m]) {
+                lv_obj_set_style_text_color(lbls[p][m], lv_color_hex(on ? 0x17122b : COLOR_LIT), 0);
+            }
+        }
+    }
+}
+
+/* dev.23: switch the unified panel's mode and remember it (the
+ * care NVS handle, like the yellow assignment), so the doors
+ * reopen on the tab the user left. */
+static void tpanel_set_mode(int mode)
+{
+    care_load();
+    mode = mode ? 1 : 0;
+    if (s_tpanel_mode != mode) {
+        s_tpanel_mode = mode;
+        if (s_care_nvs) {
+            nvs_set_u8(s_care_nvs, "tpanel_mode", (uint8_t)mode);
+            nvs_commit(s_care_nvs);
+        }
+    }
+    tpanel_sync_tabs();
+}
+
 static void pomo_end_session(void)
 {
     s_pomo.phase = POMO_IDLE;
@@ -2949,16 +3066,16 @@ static void build_pomodoro(lv_obj_t *face)
     lv_obj_set_style_radius(s_pomo_panel, 24, 0);
     lv_obj_add_flag(s_pomo_panel, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *title = make_label(s_pomo_panel, font, COLOR_LIT);
-    lv_label_set_text(title, "ポモドーロ");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+    /* dev.23: the mode tabs head the panel, in the title's place —
+     * the same row the timer panel carries. */
+    tpanel_build_tabs(s_pomo_panel, s_ptab_btn, s_ptab_lbl);
     /* みゃおっち rides along small: the face's own rendered image,
      * shared and scaled down — its expression follows the phase
      * through the frame tick's pose override, nothing of its own. */
     lv_obj_t *mini = lv_image_create(s_pomo_panel);
     lv_image_set_src(mini, &s_muse_src);
     lv_image_set_scale(mini, 72);
-    lv_obj_align(mini, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_align(mini, LV_ALIGN_TOP_MID, 0, 52);
     s_pomo_time = make_label(s_pomo_panel, FONT_CLOCK, 0xffffff);
     lv_label_set_text(s_pomo_time, "25:00");
     lv_obj_align(s_pomo_time, LV_ALIGN_TOP_MID, 0, 146);
@@ -2979,6 +3096,7 @@ static void build_pomodoro(lv_obj_t *face)
     lv_obj_set_size(close, 104, 36);
     lv_obj_align(close, LV_ALIGN_TOP_MID, 56, 330);
     pomo_refresh(true);
+    tpanel_sync_tabs();   /* dev.23: both panels exist now; light the live tab */
 
     /* The phase-end alert, the timer alert's shape: the ended phase
      * named big, what comes next under it, a tap starts that next
@@ -3025,18 +3143,13 @@ static void update_pomodoro(float now)
             pomo_arm();
         }
     }
-    /* Open requests: the face comes forward and the panel opens. */
+    /* Open requests: the face comes forward and the unified panel
+     * opens on its pomodoro tab (dev.23), which also makes pomodoro
+     * the mode the unified doors reopen in. */
     while (s_pomo_open_done != s_pomo_open_reqs) {
         s_pomo_open_done++;
-        if (s_tv && s_face) {
-            lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);
-        }
-        care_close_panel();
-        timer_close_panel();
-        s_pomo_open = true;
-        lv_obj_remove_flag(s_pomo_panel, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_pomo_panel);
-        pomo_refresh(true);
+        tpanel_set_mode(1);
+        pomo_open_panel();
     }
     /* The esp_timer fired while the frame tick slept: the alert. The
      * phase has already advanced on paper; it starts when the alert

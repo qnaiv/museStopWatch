@@ -712,7 +712,10 @@ static void yellow_long_press(void)
         break;
     case MUSE_YEL_LONG_NONE:
         break;
-    case MUSE_YEL_LONG_POMODORO:   /* dev.22 */
+    case MUSE_YEL_LONG_POMODORO:   /* dev.22; dev.23: Settings no longer
+                                    * offers it, but a stored 4 still lands
+                                    * here and opens the unified panel on
+                                    * its pomodoro tab */
         muse_ui_request_pomodoro();
         if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
             muse_state_set_hint("POMODORO");

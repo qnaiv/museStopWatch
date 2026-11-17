@@ -48,19 +48,25 @@ bool muse_ui_clock_mode(void);
 /* museStopWatch dev.16: open the countdown timer (the quick tile's
  * button, the launcher's built-in cell, the yellow button's long press).
  * From any task: the request is counted here and applied in the LVGL
- * task (the face tile comes forward and the timer panel opens). */
+ * task (the face tile comes forward and the timer panel opens).
+ * dev.23: the panel is the unified timer/pomodoro panel, and this
+ * door reopens it in the mode last used (kept in NVS). */
 void muse_ui_request_timer(void);
 /* museStopWatch dev.16: the yellow button's long-press assignment
  * (Settings > Yellow button), kept in NVS across reboots. A short press
  * always switches the face (dev.14); only the hold is assignable. */
 enum { MUSE_YEL_LONG_TIMER = 0, MUSE_YEL_LONG_APP = 1, MUSE_YEL_LONG_FACE = 2, MUSE_YEL_LONG_NONE = 3,
-       MUSE_YEL_LONG_POMODORO = 4 };   /* dev.22: appended, so stored 0..3 keep their meaning */
+       MUSE_YEL_LONG_POMODORO = 4 };   /* dev.22: appended, so stored 0..3 keep their meaning.
+                                        * dev.23: no longer offered in Settings (the timer
+                                        * door covers it), but a stored 4 stays valid: it
+                                        * opens the unified panel in pomodoro mode. */
 int muse_ui_yellow_long_action(void);
 const char *muse_ui_yellow_long_app(void);   /* the app id for MUSE_YEL_LONG_APP */
 void muse_ui_set_yellow_long(int action, const char *app_id);
-/* museStopWatch dev.22: open the pomodoro panel (the quick tile's
- * button, the launcher's built-in cell, the yellow button's long
- * press). From any task, like muse_ui_request_timer(). */
+/* museStopWatch dev.22: open the pomodoro panel. From any task,
+ * like muse_ui_request_timer(). dev.23: the panel is the unified
+ * timer/pomodoro panel; this door lands on its pomodoro tab (and
+ * makes pomodoro the mode the unified doors reopen in). */
 void muse_ui_request_pomodoro(void);
 /* museStopWatch dev.22: the pomodoro lengths (Settings > Pomodoro),
  * kept in NVS across reboots. Minutes, and how many focus phases make
