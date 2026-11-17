@@ -67,7 +67,7 @@
 
 #define COLOR_TEXT 0xf2efff
 #define COLOR_DIM 0x8b84a8
-#define COLOR_CARD 0x1a1530
+#define COLOR_CARD 0x000000   /* dev.26: pure black (OLED: unlit pixels cost nothing); rows read by their text and spacing */
 #define COLOR_CARD_PRESSED 0x2e2552
 #define COLOR_ACCENT 0xa77dff
 #define COLOR_OK 0x6ff0bf
@@ -1786,6 +1786,7 @@ static void build_power_page(lv_obj_t *tile)
 #include "msw_avatar_ui.inc"      /* museStopWatch: Settings > Avatar */
 #include "msw_yellow_ui.inc"      /* museStopWatch: Settings > Yellow button (dev.16) */
 #include "msw_pomodoro_ui.inc"    /* museStopWatch: Settings > Pomodoro (dev.22) */
+#include "msw_quiet_ui.inc"       /* museStopWatch: Settings > Quiet hours (dev.26) */
 
 /* ---------- Home ---------- */
 
@@ -1829,6 +1830,7 @@ static void build_home(lv_obj_t *tile)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     row(list, LV_SYMBOL_LIST, "Yellow button", &s_home_yellow, on_nav, (void *)&MSW_YELLOW);   /* dev.16 */
     row(list, LV_SYMBOL_BELL, "Pomodoro", &s_home_pomo, on_nav, (void *)&MSW_POMODORO);   /* dev.22 */
+    row(list, LV_SYMBOL_MUTE, "Quiet hours", &s_home_quiet, on_nav, (void *)&MSW_QUIET);   /* dev.26 */
 #endif
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
@@ -1987,6 +1989,8 @@ void muse_settings_ui_tick(bool visible)
         msw_tick_yellow();
     } else if (s_pomo_pg && s_current == s_pomo_pg) {   /* museStopWatch dev.22 */
         msw_tick_pomodoro();
+    } else if (s_quiet_pg && s_current == s_quiet_pg) {   /* museStopWatch dev.26 */
+        msw_tick_quiet();
     }
 #endif
     else {

@@ -94,7 +94,7 @@ static const char *TAG = "muse_ui";
 #define COLOR_ACCENT 0xa77dff
 #define COLOR_DOT_OFF 0x3a3358
 #define COLOR_LIT 0xf2efff
-#define COLOR_CARD_BG 0x201d33    /* dashboard section card, a step above the tile's black */
+#define COLOR_CARD_BG 0x000000    /* dev.26: panels and dashboard cards sit on pure black (OLED: unlit pixels cost nothing); sections read by their title bar and spacing */
 #define COLOR_CARD_BAR 0xa78bfa   /* dashboard section card title accent bar */
 #define SETTINGS_TICK_S 0.25f
 
@@ -349,6 +349,21 @@ static void pomo_open_panel(void);       /* the pomodoro section, below */
 static void pomo_end_session(void);      /* the pomodoro section, below */
 static void tpanel_set_mode(int mode);   /* dev.23: the pomodoro section, below */
 static void tpanel_sync_tabs(void);      /* dev.23: the pomodoro section, below */
+/* dev.26: night quiet hours. While the window is on, automatic
+ * network wakes stop — the sleep periodic check (muse_input.c's
+ * nap_check) never lifts the Wi-Fi nap, and the dashboard does not
+ * fetch on a wake edge — so the watch rests until the window ends;
+ * pending messages land at the next regular check after that. Local
+ * life is untouched: button/tap wakes, the screen, timer and
+ * pomodoro alerts (esp_timer) and a voice turn the user starts all
+ * work as before. The values ride the care NVS handle (loaded inline
+ * by care_load, like face_mode and yel_l_act); Settings > Quiet
+ * hours edits them through muse_ui_quiet_config(). Defaults on,
+ * 23:00 to 07:00; the window may span midnight. */
+static struct {
+    bool on;
+    uint16_t start_min, end_min;   /* minutes from midnight */
+} s_quiet = { .on = true, .start_min = 23 * 60, .end_min = 7 * 60 };
 /* dev.16: the yellow button's long-press assignment (Settings > Yellow
  * button), in the care NVS handle beside face_mode. The action defaults
  * to the timer; the app id matters only for MUSE_YEL_LONG_APP. */
@@ -451,6 +466,10 @@ static void care_load(void)
         if (nvs_get_u8(s_care_nvs, "face_mode", &b) == ESP_OK) s_clock_mode = b != 0;
         if (nvs_get_u8(s_care_nvs, "yel_l_act", &b) == ESP_OK && b <= MUSE_YEL_LONG_POMODORO) s_yel_long_act = b;
         if (nvs_get_u8(s_care_nvs, "tpanel_mode", &b) == ESP_OK && b <= 1) s_tpanel_mode = b;   /* dev.23 */
+        uint16_t qm;   /* dev.26: quiet hours (see s_quiet) */
+        if (nvs_get_u8(s_care_nvs, "quiet_on", &b) == ESP_OK) s_quiet.on = b != 0;
+        if (nvs_get_u16(s_care_nvs, "quiet_beg", &qm) == ESP_OK && qm < 1440) s_quiet.start_min = qm;
+        if (nvs_get_u16(s_care_nvs, "quiet_end", &qm) == ESP_OK && qm < 1440) s_quiet.end_min = qm;
         size_t yn = sizeof(s_yel_long_app);
         if (nvs_get_str(s_care_nvs, "yel_l_app", s_yel_long_app, &yn) != ESP_OK) s_yel_long_app[0] = '\0';
     }
@@ -3262,6 +3281,53 @@ void muse_ui_set_pomodoro_config(const muse_pomo_cfg_t *cfg)
     }
 }
 
+/* Settings > Quiet hours (msw_quiet_ui.inc) reads and writes the
+ * window through here; the setter saves at once, like every other
+ * setting on this handle. */
+void muse_ui_quiet_config(muse_quiet_cfg_t *out)
+{
+    care_load();
+    out->on = s_quiet.on;
+    out->start_min = s_quiet.start_min;
+    out->end_min = s_quiet.end_min;
+}
+
+void muse_ui_set_quiet_config(const muse_quiet_cfg_t *cfg)
+{
+    care_load();
+    s_quiet.on = cfg->on;
+    s_quiet.start_min = (uint16_t)(cfg->start_min < 0 ? 0 : cfg->start_min > 1439 ? 1439 : cfg->start_min);
+    s_quiet.end_min = (uint16_t)(cfg->end_min < 0 ? 0 : cfg->end_min > 1439 ? 1439 : cfg->end_min);
+    if (s_care_nvs) {
+        nvs_set_u8(s_care_nvs, "quiet_on", s_quiet.on ? 1 : 0);
+        nvs_set_u16(s_care_nvs, "quiet_beg", s_quiet.start_min);
+        nvs_set_u16(s_care_nvs, "quiet_end", s_quiet.end_min);
+        nvs_commit(s_care_nvs);
+    }
+}
+
+/* The one gate the automatic wake paths consult (dev.26): the sleep
+ * periodic check in muse_input.c and the dashboard's wake fetch in
+ * update_sleep(). Local time from the RTC-backed clock; an unset
+ * clock never engages the window, and neither does an empty one
+ * (start == end). */
+bool muse_ui_quiet_active(void)
+{
+    care_load();
+    if (!s_quiet.on || s_quiet.start_min == s_quiet.end_min) {
+        return false;
+    }
+    struct tm local;
+    if (!msw_time_now || !msw_time_now(&local)) {
+        return false;   /* the clock is not set yet */
+    }
+    int now_min = local.tm_hour * 60 + local.tm_min;
+    if (s_quiet.start_min < s_quiet.end_min) {
+        return now_min >= s_quiet.start_min && now_min < s_quiet.end_min;
+    }
+    return now_min >= s_quiet.start_min || now_min < s_quiet.end_min;   /* spans midnight */
+}
+
 /*
  * The dashboard tile (right of the face): the morning/evening "edition"
  * Muse writes to watch_edition.json on the VM. The tile fetches it on its
@@ -4800,7 +4866,12 @@ static bool update_sleep(void)
     } else if (!asleep && s_dark) {
         s_dark = false;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-        dash_note_wake();   /* the dashboard fetches a fresh edition on wake */
+        /* dev.26: in the quiet-hours window a wake (a timer alert's,
+         * say) does not fetch the dashboard; the next wake outside
+         * the window, or opening the tile, fetches as before. */
+        if (!muse_ui_quiet_active()) {
+            dash_note_wake();   /* the dashboard fetches a fresh edition on wake */
+        }
 #endif
         if (muse_board->panel_sleep) {
             muse_board->panel_sleep(false);
@@ -5497,10 +5568,15 @@ static void frame_tick(lv_timer_t *timer)
     bool render = !muse_board->epaper || mode != s_last_epaper_pose;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     /* Battery: the avatar doesn't need redrawing 25 times a second —
-     * a quarter of that (about 6 fps) reads fine and costs far less,
-     * so the pose renders at a quarter rate all the time. A quiet idle
-     * face — nothing said, nothing to read — drops further after
-     * ~10 s, to a sixteenth (nearly still); anything new wakes it up. */
+     * live modes render at a quarter rate (about 6 fps), which reads
+     * fine and costs far less. dev.26: an idle face is only ambient
+     * animation (breathing, blinking, the care face's little
+     * bounces), so it steps at ~4 fps — every 6th of the 40 ms
+     * ticks; choppy is fine for a face that is just sitting there.
+     * A quiet idle face — nothing said, nothing to read — drops
+     * further after ~10 s, to a sixteenth (nearly still); anything
+     * new wakes it up. Interactive motion is not gated here: this
+     * only ever skips pose renders. */
     static unsigned s_quiet_ticks;
     static unsigned s_frame_ticks;
     bool quiet = mode == MUSE_MODE_IDLE && s_face_active
@@ -5511,7 +5587,7 @@ static void frame_tick(lv_timer_t *timer)
     } else {
         s_quiet_ticks = 0;
     }
-    if (++s_frame_ticks % (s_quiet_ticks > 250 ? 16 : 4) != 0) render = false;
+    if (++s_frame_ticks % (s_quiet_ticks > 250 ? 16 : mode == MUSE_MODE_IDLE ? 6 : 4) != 0) render = false;
 #endif
     if (render) {
         muse_pixel_render(&pose);

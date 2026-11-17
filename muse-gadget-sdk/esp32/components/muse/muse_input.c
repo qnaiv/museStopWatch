@@ -616,6 +616,19 @@ static bool nap_check(TickType_t now, bool want_nap)
         s_nap_check_open = false;
         due = now + pdMS_TO_TICKS((TickType_t)muse_settings_sleep_check_min() * 60 * 1000);
     }
+    /* dev.26: night quiet hours — no periodic check at all while the
+     * window is on, so Wi-Fi stays down and nothing polls for held
+     * messages; they are fetched at the first check after the window
+     * ends. Logged once per entry, like the window opening below. */
+    static bool quiet_noted;
+    if (muse_ui_quiet_active()) {
+        if (!quiet_noted) {
+            quiet_noted = true;
+            ESP_LOGI(TAG, "nap check: quiet hours, no checks until the window ends");
+        }
+        return true;
+    }
+    quiet_noted = false;
     if (!muse_settings_sleep_check()) {
         return true;
     }

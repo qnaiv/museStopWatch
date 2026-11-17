@@ -76,6 +76,22 @@ typedef struct {
 } muse_pomo_cfg_t;
 void muse_ui_pomodoro_config(muse_pomo_cfg_t *out);
 void muse_ui_set_pomodoro_config(const muse_pomo_cfg_t *cfg);
+/* museStopWatch dev.26: night quiet hours (Settings > Quiet hours),
+ * kept in NVS across reboots. While the window is on, automatic
+ * network wakes stop: no periodic sleep check (muse_input.c) and no
+ * dashboard fetch on wake. Local time only; the window may span
+ * midnight. Times are minutes from midnight. Defaults on, 23:00 to
+ * 07:00. */
+typedef struct {
+    bool on;
+    int start_min, end_min;
+} muse_quiet_cfg_t;
+void muse_ui_quiet_config(muse_quiet_cfg_t *out);
+void muse_ui_set_quiet_config(const muse_quiet_cfg_t *cfg);
+/* True while the local time is inside the configured window. False
+ * when the setting is off, the window is empty, or the clock is not
+ * set yet. */
+bool muse_ui_quiet_active(void);
 /* museStopWatch dev.25: send the battery history to Muse as chat
  * messages, so Muse can save and analyse it. Called only by the
  * Battery page's 「履歴を送る」 button — a manual send, never automatic
