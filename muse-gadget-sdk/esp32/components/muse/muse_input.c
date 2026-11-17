@@ -79,6 +79,18 @@ void muse_input_app_talk(bool pressed)
     atomic_fetch_or(&s_app_talk_events, pressed ? MUSE_BTN_TALK_PRESS : MUSE_BTN_TALK_RELEASE);
 }
 
+/* museStopWatch dev.27: the touch lock (see touch_lock_filter below).
+ * The state lives outside the StopWatch block because the board's touch
+ * read consults it through muse_input_touch_locked(); only the
+ * StopWatch's button filter ever changes it. Not kept across a reboot:
+ * a boot always starts unlocked. */
+static bool s_touch_locked;
+
+bool muse_input_touch_locked(void)
+{
+    return s_touch_locked;
+}
+
 static const char *TAG = "muse_input";
 
 #define POLL_MS 10
@@ -851,6 +863,138 @@ static void dedicated_buttons(unsigned ev)
 #endif
 }
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/*
+ * dev.27: the touch lock, toggled by pressing yellow and blue together.
+ * While it is on, the screen stays on and keeps showing, but the
+ * board's touch read reports no press (muse_input_touch_locked), so
+ * the LVGL UI and the mini apps — msw_touch() reads the state of the
+ * same indev — both ignore touch until the combo is pressed again.
+ * The buttons themselves are untouched: they are the way back out,
+ * and the power and aux buttons never come through here.
+ *
+ * A press of either button might be the first half of the combo, so a
+ * press edge is held back for COMBO_WINDOW_US before it is passed on.
+ * If the other button's press lands inside the window, neither press
+ * is ever passed on, and both buttons are swallowed until both are
+ * up, so neither half can still do its own job (yellow's face switch
+ * or hold action, blue's voice press) on the way out. A release that
+ * arrives first lets the held-back press out with it, as a tap, and a
+ * lone press goes out when the window lapses — up to 200 ms late,
+ * which is the price of the gesture. Only the physical buttons from
+ * poll_buttons() come through here; the on-screen mic button and a
+ * mini app's own talk control join ev afterwards, untouched.
+ */
+#define COMBO_WINDOW_US (200 * 1000)
+static bool s_lock_yel_down, s_lock_blu_down;   /* the physical buttons, by their edges */
+static bool s_lock_yel_pend, s_lock_blu_pend;   /* a press edge held back for the window */
+static int64_t s_lock_yel_at, s_lock_blu_at;    /* when the held-back press landed */
+static bool s_lock_swallow;                     /* the combo fired: eat both until both are up */
+
+static void touch_lock_toggle(void)
+{
+    s_touch_locked = !s_touch_locked;
+    ESP_LOGI(TAG, "touch lock %s (yellow+blue)", s_touch_locked ? "on" : "off");
+    muse_state_poke();
+    if (muse_state_asleep()) {
+        set_asleep(false, "touch lock");   /* the press wakes, like any other */
+    }
+    if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+        muse_state_set_hint(s_touch_locked ? "TOUCH LOCK ON" : "TOUCH LOCK OFF");
+    }
+}
+
+static unsigned touch_lock_filter(unsigned ev)
+{
+    const unsigned yel = MUSE_BTN_SPEAKER_PRESS | MUSE_BTN_SPEAKER_RELEASE;
+    const unsigned blu = MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE;
+    unsigned out = ev & ~(yel | blu);   /* everything else passes at once */
+    bool yp = (ev & MUSE_BTN_SPEAKER_PRESS) != 0;
+    bool yr = (ev & MUSE_BTN_SPEAKER_RELEASE) != 0;
+    bool bp = (ev & MUSE_BTN_TALK_PRESS) != 0;
+    bool br = (ev & MUSE_BTN_TALK_RELEASE) != 0;
+    int64_t now = esp_timer_get_time();
+
+    if (yp) s_lock_yel_down = true;
+    if (yr) s_lock_yel_down = false;
+    if (bp) s_lock_blu_down = true;
+    if (br) s_lock_blu_down = false;
+
+    if (s_lock_swallow) {
+        if (!s_lock_yel_down && !s_lock_blu_down) {
+            s_lock_swallow = false;
+        }
+        return out;
+    }
+
+    /* The combo: the second press lands while the first is still held
+     * back inside the window (or both land in the same poll). Neither
+     * press is passed on, and both buttons are swallowed until both
+     * are up. */
+    if ((yp && bp)
+        || (yp && s_lock_blu_pend && now - s_lock_blu_at <= COMBO_WINDOW_US)
+        || (bp && s_lock_yel_pend && now - s_lock_yel_at <= COMBO_WINDOW_US)) {
+        s_lock_yel_pend = s_lock_blu_pend = false;
+        s_lock_swallow = true;
+        touch_lock_toggle();
+        return out;
+    }
+
+    /* A new press is held back for the window. A press already held
+     * back whose window lapsed while the input task rested goes out
+     * first, ahead of it: it was a lone press after all. */
+    if (yp) {
+        if (s_lock_blu_pend) {
+            out |= MUSE_BTN_TALK_PRESS;
+            s_lock_blu_pend = false;
+        }
+        s_lock_yel_pend = true;
+        s_lock_yel_at = now;
+    }
+    if (bp) {
+        if (s_lock_yel_pend) {
+            out |= MUSE_BTN_SPEAKER_PRESS;
+            s_lock_yel_pend = false;
+        }
+        s_lock_blu_pend = true;
+        s_lock_blu_at = now;
+    }
+
+    /* A release lets a held-back press out with it, as a tap; a release
+     * for a press already passed on goes straight out. */
+    if (yr) {
+        if (s_lock_yel_pend) {
+            out |= MUSE_BTN_SPEAKER_PRESS;
+            s_lock_yel_pend = false;
+        }
+        out |= MUSE_BTN_SPEAKER_RELEASE;
+    }
+    if (br) {
+        if (s_lock_blu_pend) {
+            out |= MUSE_BTN_TALK_PRESS;
+            s_lock_blu_pend = false;
+        }
+        out |= MUSE_BTN_TALK_RELEASE;
+    }
+
+    /* A press still held when its window lapses goes out on its own. */
+    if (s_lock_yel_pend && now - s_lock_yel_at >= COMBO_WINDOW_US) {
+        out |= MUSE_BTN_SPEAKER_PRESS;
+        s_lock_yel_pend = false;
+    }
+    if (s_lock_blu_pend && now - s_lock_blu_at >= COMBO_WINDOW_US) {
+        out |= MUSE_BTN_TALK_PRESS;
+        s_lock_blu_pend = false;
+    }
+    return out;
+}
+
+static bool touch_lock_press_pending(void)
+{
+    return s_lock_yel_pend || s_lock_blu_pend;
+}
+#endif
+
 static void input_task(void *arg)
 {
     (void)arg;
@@ -860,7 +1004,11 @@ static void input_task(void *arg)
     TickType_t powered = xTaskGetTickCount() - pdMS_TO_TICKS(POWER_MS);
 
     for (;;) {
-        unsigned ev = muse_board->poll_buttons() | atomic_exchange(&s_touch_talk_events, 0);
+        unsigned ev = muse_board->poll_buttons();
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        ev = touch_lock_filter(ev);   /* dev.27: yellow+blue together is the touch lock */
+#endif
+        ev |= atomic_exchange(&s_touch_talk_events, 0);
         unsigned app_talk = atomic_exchange(&s_app_talk_events, 0);
         ev |= app_talk;
 #if CONFIG_MUSE_VIDEO
@@ -947,8 +1095,15 @@ static void input_task(void *arg)
         muse_battery_note_state(muse_state_asleep(), s_cpu_low);
         /* Paused, anything but a button (a pairing prompt, an image) is
          * noticed within REST_WAIT_MS. Napping, nothing comes over the
-         * network; USB power arriving is noticed within NAP_WAIT_MS. */
-        if (paused && muse_board->wait_buttons) {
+         * network; USB power arriving is noticed within NAP_WAIT_MS.
+         * dev.27: while a press is held back for the touch-lock combo
+         * window, poll on the short delay even at rest, so the window
+         * is seen out promptly instead of at the rest wait. */
+        bool combo_pending = false;
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+        combo_pending = touch_lock_press_pending();
+#endif
+        if (paused && muse_board->wait_buttons && !combo_pending) {
             muse_board->wait_buttons(napping ? NAP_WAIT_MS : REST_WAIT_MS);
         } else {
             vTaskDelay(pdMS_TO_TICKS(paused ? REST_POLL_MS : POLL_MS));

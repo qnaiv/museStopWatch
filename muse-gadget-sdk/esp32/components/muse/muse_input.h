@@ -68,6 +68,12 @@ bool muse_input_cpu_pd(void);
  * nap off so the session can reconnect and look for held messages. */
 bool muse_input_nap_check_open(void);
 
+/* museStopWatch dev.27: true while the touch lock is on (yellow+blue
+ * pressed together toggles it, in muse_input.c). The StopWatch board's
+ * touch read reports no press then, so the UI and the mini apps ignore
+ * touch while the screen stays on. Always false on other boards. */
+bool muse_input_touch_locked(void);
+
 /* PTT events are posted to `queue` (items are muse_input_event_t). */
 esp_err_t muse_input_start(QueueHandle_t queue);
 /* The voice task has entered the call this DOWN's `mark` started, or dropped

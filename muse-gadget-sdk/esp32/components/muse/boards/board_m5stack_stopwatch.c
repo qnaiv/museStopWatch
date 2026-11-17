@@ -73,6 +73,7 @@
 
 #include "muse_audio.h"
 #include "muse_board.h"
+#include "muse_input.h"
 #include "muse_lcd_bands.h"
 #include "muse_mem.h"
 #include "soc/spi_periph.h"
@@ -622,6 +623,14 @@ void board_stopwatch_tp_dump(int seconds)
 static void tp_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
+    /* dev.27: the touch lock (yellow+blue, muse_input.c). Report no
+     * press while it is on: the LVGL UI goes deaf, and mini apps too —
+     * msw_touch() reads this indev's state, so the one gate here is
+     * the only touch path there is. The panel is not even read. */
+    if (muse_input_touch_locked()) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     uint8_t raw[16];
     const uint8_t *b = raw + TP_REG_POINTS;
     if (reg_read(s_tp, 0x00, raw, sizeof(raw)) != ESP_OK) {
