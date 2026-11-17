@@ -4080,8 +4080,21 @@ static void update_dash(void)
  * upload under the next path form in BATT_HIST_PATHS — the bare home path
  * drew a 403 for /fs/read in dev.10, so the daemon's answer may depend on
  * the form. A form that lands sticks for the next attempts.
+ *
+ * dev.24: the refusal is now confirmed on device (dev.23, 2026-11-17):
+ * piece 1, HTTP 403, the daemon's reply begins "root not allowed for
+ * this credential scope". So the scope is a per-root allowlist: the
+ * "workspace" root is readable by gadget credentials (the dash fetch
+ * proves it daily) but NOT writable, and the bare home path is denied
+ * outright — all three dev.21 forms are dead ends. The SDK's own
+ * device-token file example (muse-gadget-sdk/linux/README.md, "History
+ * and user-VM files") uses the root "gadget-data" for both read and
+ * write, so that form now leads the list; the file lands at
+ * ~/gadget-data/battery_history.json on the VM instead. The workspace
+ * forms stay behind it in case a scope change ever allows them.
  */
 static const char *const BATT_HIST_PATHS[] = {
+    "gadget-data/battery_history.json",
     "workspace/battery_history.json",
     "/workspace/battery_history.json",
     "battery_history.json",

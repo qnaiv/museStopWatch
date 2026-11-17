@@ -77,7 +77,8 @@ typedef struct {
 void muse_ui_pomodoro_config(muse_pomo_cfg_t *out);
 void muse_ui_set_pomodoro_config(const muse_pomo_cfg_t *cfg);
 /* museStopWatch dev.17: ask for the battery history to be uploaded to the
- * VM (workspace/battery_history.json) so Muse can analyse it. Cheap to
+ * VM (dev.24: gadget-data/battery_history.json — the "workspace" root is
+ * read-only for gadget credentials) so Muse can analyse it. Cheap to
  * call often (the Battery page's tick does): it starts nothing while an
  * upload is recent, running, or barely owed. */
 void muse_batt_hist_upload_request(void);
@@ -87,9 +88,9 @@ void muse_batt_hist_upload_request(void);
  * stage is one of MUSE_BATT_HIST_UP_*; when it is UP_WRITE, piece (0-based),
  * http (0: no reply arrived), ok (1 true, 0 false, -1 absent/unread) and
  * reply (the reply's first bytes) describe the piece that failed. path is
- * the /fs/write path form the attempt used (0 "workspace/…", 1
- * "/workspace/…", 2 the bare name); at is when the attempt ended (wall
- * clock, seconds). */
+ * the /fs/write path form the attempt used (dev.24: 0 "gadget-data/…",
+ * 1 "workspace/…", 2 "/workspace/…", 3 the bare name); at is when the
+ * attempt ended (wall clock, seconds). */
 enum {
     MUSE_BATT_HIST_UP_NONE = 0,      /* no attempt yet this boot */
     MUSE_BATT_HIST_UP_WAIT_LINK,     /* the session never came up */

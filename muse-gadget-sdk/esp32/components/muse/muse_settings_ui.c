@@ -1567,7 +1567,9 @@ static void tick_battery_upload(void)
 {
     muse_batt_hist_up_t up;
     muse_batt_hist_upload_last(&up);
-    char buf[96], t[8] = "";
+    char buf[128], t[8] = "";   /* dev.24: 128, not 96 — the path-form
+                                 * directive pushed the compiler's worst-case
+                                 * length past 96 (-Werror=format-truncation) */
     if (up.at > 1700000000LL) {   /* the wall clock is set */
         time_t at = (time_t)up.at;
         struct tm tmv;
@@ -1593,11 +1595,16 @@ static void tick_battery_upload(void)
         snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 送信データなし", t);
         break;
     case MUSE_BATT_HIST_UP_WRITE:
+        /* dev.24: name the path form too — with several roots on trial,
+         * which one refused is the diagnosis (dev.21 showed it only on
+         * success). */
         if (up.http > 0) {
-            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目 HTTP %d%s", t, up.piece + 1,
+            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目（パス形式%d） HTTP %d%s", t,
+                     up.piece + 1, up.path + 1,
                      up.http, up.ok == 0 ? " ok=false" : up.ok == 1 ? " ok=true" : "");
         } else {
-            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目 応答なし", t, up.piece + 1);
+            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目（パス形式%d） 応答なし", t,
+                     up.piece + 1, up.path + 1);
         }
         break;
     default:
