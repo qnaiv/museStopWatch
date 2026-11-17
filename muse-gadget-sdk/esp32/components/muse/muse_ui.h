@@ -76,33 +76,31 @@ typedef struct {
 } muse_pomo_cfg_t;
 void muse_ui_pomodoro_config(muse_pomo_cfg_t *out);
 void muse_ui_set_pomodoro_config(const muse_pomo_cfg_t *cfg);
-/* museStopWatch dev.17: ask for the battery history to be uploaded to the
- * VM (dev.24: gadget-data/battery_history.json — the "workspace" root is
- * read-only for gadget credentials) so Muse can analyse it. Cheap to
- * call often (the Battery page's tick does): it starts nothing while an
- * upload is recent, running, or barely owed. */
-void muse_batt_hist_upload_request(void);
-/* museStopWatch dev.21: the last upload attempt, for the Battery page's
+/* museStopWatch dev.25: send the battery history to Muse as chat
+ * messages, so Muse can save and analyse it. Called only by the
+ * Battery page's 「履歴を送る」 button — a manual send, never automatic
+ * (the dev.17–24 POST /fs/write upload never landed: the gadget
+ * credential scope has no writable fs root, every path form drew
+ * HTTP 403). The history rides typed turns, chunked per the wire
+ * format in muse_ui.c. A call while a send runs is ignored. */
+void muse_batt_hist_send_request(void);
+/* museStopWatch dev.21: the last send attempt, for the Battery page's
  * note — dev.17's failures went only to the log, which cannot be read
- * off the device, so a refused upload looked exactly like a landed one.
- * stage is one of MUSE_BATT_HIST_UP_*; when it is UP_WRITE, piece (0-based),
- * http (0: no reply arrived), ok (1 true, 0 false, -1 absent/unread) and
- * reply (the reply's first bytes) describe the piece that failed. path is
- * the /fs/write path form the attempt used (dev.24: 0 "gadget-data/…",
- * 1 "workspace/…", 2 "/workspace/…", 3 the bare name); at is when the
- * attempt ended (wall clock, seconds). */
+ * off the device, so a failed send looked exactly like a landed one.
+ * stage is one of MUSE_BATT_HIST_UP_*; sent/total count the messages
+ * handed to the chat (the payload chunks plus the end marker); at is
+ * when the attempt ended (wall clock, seconds). */
 enum {
     MUSE_BATT_HIST_UP_NONE = 0,      /* no attempt yet this boot */
-    MUSE_BATT_HIST_UP_WAIT_LINK,     /* the session never came up */
-    MUSE_BATT_HIST_UP_DASH_BUSY,     /* a dash fetch was running; skipped */
+    MUSE_BATT_HIST_UP_WAIT_LINK,     /* chat not set up, or Wi-Fi down */
+    MUSE_BATT_HIST_UP_BUSY,          /* a turn had the session; not sent */
     MUSE_BATT_HIST_UP_BUILD,         /* nothing to send */
-    MUSE_BATT_HIST_UP_WRITE,         /* a piece failed */
-    MUSE_BATT_HIST_UP_DONE,          /* every piece landed */
+    MUSE_BATT_HIST_UP_SEND,          /* a message could not be handed off */
+    MUSE_BATT_HIST_UP_DONE,          /* every message handed off */
 };
 typedef struct {
     int64_t at;
-    int stage, piece, http, ok, path;
-    char reply[49];
+    int stage, sent, total;
 } muse_batt_hist_up_t;
 void muse_batt_hist_upload_last(muse_batt_hist_up_t *out);
 #endif

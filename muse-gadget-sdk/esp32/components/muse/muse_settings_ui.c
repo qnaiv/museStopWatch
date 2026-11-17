@@ -1516,6 +1516,16 @@ static void on_battery_reset(lv_event_t *e)
     s_batt_shown_us = 0;   /* show it now */
 }
 
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+/* dev.25: the history goes to Muse by chat (typed turns); the send
+ * itself lives in muse_ui.c and reports back through the note below. */
+static void on_battery_send(lv_event_t *e)
+{
+    (void)e;
+    muse_batt_hist_send_request();
+}
+#endif
+
 #define BATT_CHART_POINTS 48   /* the last 24 hours at the history's 30-minute spacing */
 
 static void build_battery_page(lv_obj_t *tile)
@@ -1542,6 +1552,7 @@ static void build_battery_page(lv_obj_t *tile)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     s_batt_upload = note(list, "");
     s_batt_up_reply = note(list, "");
+    button(list, "履歴を送る", COLOR_ACCENT, on_battery_send, NULL);   /* dev.25: by chat, not /fs/write */
 #endif
     s_batt_hist_sig = 0;
     s_batt_level = info_row(list, "残量");   /* museStopWatch: Japanese */
@@ -1558,18 +1569,17 @@ static void build_battery_page(lv_obj_t *tile)
                "チップ休止は省電力の眠り（ライトスリープ）、CPU 稼働はどれかのコアが処理をしていた時間です。");
 }
 
-/* dev.21: the upload note under the drain rows: the last attempt's stage,
- * and the daemon's answer when a piece was refused. Refreshed on every
- * tick, not only on a new point — an attempt can end while the page is
- * open (the page's own opening asks for it). */
+/* dev.21: the send note under the drain rows: the last attempt's stage
+ * and, for a chat send (dev.25), how many of its messages got out.
+ * Refreshed on every tick, not only on a new point — an attempt can end
+ * while the page is open (the send runs on its own task). */
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
 static void tick_battery_upload(void)
 {
     muse_batt_hist_up_t up;
     muse_batt_hist_upload_last(&up);
-    char buf[128], t[8] = "";   /* dev.24: 128, not 96 — the path-form
-                                 * directive pushed the compiler's worst-case
-                                 * length past 96 (-Werror=format-truncation) */
+    char buf[128], t[8] = "";   /* 128 since dev.24: the format directives'
+                                 * worst case outgrew 96 (-Werror=format-truncation) */
     if (up.at > 1700000000LL) {   /* the wall clock is set */
         time_t at = (time_t)up.at;
         struct tm tmv;
@@ -1579,52 +1589,39 @@ static void tick_battery_upload(void)
     }
     switch (up.stage) {
     case MUSE_BATT_HIST_UP_DONE:
-        if (up.path > 0) {
-            snprintf(buf, sizeof(buf), "履歴を送信しました%s（パス形式%d）", t, up.path + 1);
-        } else {
-            snprintf(buf, sizeof(buf), "履歴を送信しました%s", t);
-        }
+        snprintf(buf, sizeof(buf), "履歴を送信しました%s（%d/%d件）", t, up.sent, up.total);
         break;
     case MUSE_BATT_HIST_UP_WAIT_LINK:
-        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 接続待ち時間切れ", t);
+        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 接続できていません", t);
         break;
-    case MUSE_BATT_HIST_UP_DASH_BUSY:
-        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 取得処理と競合", t);
+    case MUSE_BATT_HIST_UP_BUSY:
+        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 会話中でした", t);
         break;
     case MUSE_BATT_HIST_UP_BUILD:
         snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: 送信データなし", t);
         break;
-    case MUSE_BATT_HIST_UP_WRITE:
-        /* dev.24: name the path form too — with several roots on trial,
-         * which one refused is the diagnosis (dev.21 showed it only on
-         * success). */
-        if (up.http > 0) {
-            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目（パス形式%d） HTTP %d%s", t,
-                     up.piece + 1, up.path + 1,
-                     up.http, up.ok == 0 ? " ok=false" : up.ok == 1 ? " ok=true" : "");
-        } else {
-            snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s: %d件目（パス形式%d） 応答なし", t,
-                     up.piece + 1, up.path + 1);
-        }
+    case MUSE_BATT_HIST_UP_SEND:
+        snprintf(buf, sizeof(buf), "履歴の送信に失敗しました%s（%d/%d件）", t, up.sent, up.total);
         break;
     default:
         strlcpy(buf, "履歴はまだ送信していません", sizeof(buf));
         break;
     }
     set_text(s_batt_upload, buf);
-    set_text(s_batt_up_reply, up.reply);
+    set_text(s_batt_up_reply, up.stage == MUSE_BATT_HIST_UP_DONE
+                                  ? "チャットで送りました。Muse がファイルに保存します"
+                                  : "");
 }
 #endif
 
 /* dev.17: the chart (the last BATT_CHART_POINTS points, gaps before the
  * first of them), the note's time range and the two drain rows; refilled
- * only when a new point lands. Opening the page also asks muse_ui to upload
- * the history for Muse (it throttles itself). */
+ * only when a new point lands. dev.25: sending the history is the
+ * button's job, never the page's — opening the page only shows the note. */
 static void tick_battery_hist(void)
 {
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-    muse_batt_hist_upload_request();   /* dev.17: the upload lives in muse_ui.c */
-    tick_battery_upload();             /* dev.21: and show how the last one went */
+    tick_battery_upload();             /* dev.21: show how the last send went */
 #endif
     int n = muse_battery_hist_count();
     muse_batt_point_t last;

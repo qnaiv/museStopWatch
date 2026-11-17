@@ -4053,102 +4053,46 @@ static void update_dash(void)
         s_dash_dirty = false;
         render_dash();
     }
-    /* dev.17: a charge start (or anything else) that left history points
-     * unsent gets its upload at the next wake; the request throttles. */
-    muse_batt_hist_upload_request();
 }
 
 /*
- * dev.17: the battery history upload, the dash fetch's mirror image. The
- * points muse_battery keeps (muse_battery.h) go to a BATT_HIST_PATHS
- * path on the VM by POST /fs/write: the first piece overwrites, the rest
- * append, each piece's text under the body bound (AGENTS.md). Muse reads
- * the file when asked to analyse the battery. Triggers: Settings >
- * Battery asks on open, update_dash() asks on wake; batt_hist_due() keeps both polite (an hour
- * between uploads unless 4 or more points are owed, 5 minutes between
- * attempts). Failures are silent and retried at the next ask. Never beside
- * a dash fetch: the link allows 3 requests at once and the fetch matters
- * more, so an upload that finds one running waits for the next ask.
+ * dev.25: the battery history goes to Muse as chat messages. dev.17
+ * sent it by POST /fs/write; that never landed once, and dev.24 proved
+ * why on device: every path form -- "gadget-data/...", "workspace/...",
+ * "/workspace/...", the bare name -- drew HTTP 403 "root not allowed
+ * for this credential scope". The gadget scope can read the VM's files
+ * but has no writable root, so no path can fix it. The history now
+ * rides the channel the approval buttons already use: typed turns
+ * (muse_hatch_text_turn, muse_chat.h), whose replies go to the serial
+ * console only -- the face is never disturbed, and the late-reply path
+ * is never armed for text turns (check_turn() in muse_chat_session.cpp).
  *
- * dev.21: as shipped, the upload never landed once — and nothing on the
- * device could say so: failures went only to the log, and a piece counted
- * as written on HTTP 200 alone, without the {ok, result} envelope check
- * the /fs/read side has always done. Now a piece must also carry an
- * envelope whose ok is not false, the last attempt is kept in
- * s_batt_hist_last for the Battery page's note (the dash tile's s_dash_err
- * is the precedent), and a refusal (403, or ok:false) retries the whole
- * upload under the next path form in BATT_HIST_PATHS — the bare home path
- * drew a 403 for /fs/read in dev.10, so the daemon's answer may depend on
- * the form. A form that lands sticks for the next attempts.
+ * Wire format (the chat side parses exactly this; also written up in
+ * work/battery-history-design-2026-11-16.md): the JSON the /fs/write
+ * upload built, split into chunks of at most BATT_HIST_CHUNK chars;
+ * each chunk is one chat message whose first line is
+ * "[battery_history v1 <i>/<n>]" (1-based), followed by the chunk text;
+ * after the last chunk, one final message "[battery_history end]".
+ * Nothing else goes in those messages.
  *
- * dev.24: the refusal is now confirmed on device (dev.23, 2026-11-17):
- * piece 1, HTTP 403, the daemon's reply begins "root not allowed for
- * this credential scope". So the scope is a per-root allowlist: the
- * "workspace" root is readable by gadget credentials (the dash fetch
- * proves it daily) but NOT writable, and the bare home path is denied
- * outright — all three dev.21 forms are dead ends. The SDK's own
- * device-token file example (muse-gadget-sdk/linux/README.md, "History
- * and user-VM files") uses the root "gadget-data" for both read and
- * write, so that form now leads the list; the file lands at
- * ~/gadget-data/battery_history.json on the VM instead. The workspace
- * forms stay behind it in case a scope change ever allows them.
+ * Manual only: the Battery page's button asks; nothing sends on wake
+ * or on page open, so the chat gains no surprise traffic. Points count
+ * as sent (muse_battery_hist_mark_sent) only once every message has
+ * been handed to the chat queue. The last attempt is kept in
+ * s_batt_hist_last for the Battery page's note (dev.21's rule: a failed
+ * send is visible on the device, not only in the log).
  */
-static const char *const BATT_HIST_PATHS[] = {
-    "gadget-data/battery_history.json",
-    "workspace/battery_history.json",
-    "/workspace/battery_history.json",
-    "battery_history.json",
-};
-#define BATT_HIST_PATH_COUNT (int)(sizeof(BATT_HIST_PATHS) / sizeof(BATT_HIST_PATHS[0]))
-static int s_batt_hist_path_idx;   /* the form to try first; a winner sticks */
-#define BATT_HIST_CAP (16 * 1024)      /* the whole file text, at most */
-#define BATT_HIST_PIECE 6000           /* one /fs/write's text piece */
-#define BATT_HIST_ENV_CAP (BATT_HIST_PIECE * 2 + 256)   /* the piece, JSON-escaped, plus the envelope */
-#define BATT_HIST_FRESH_US (3600LL * 1000 * 1000)       /* an upload an hour old is fresh */
-#define BATT_HIST_RETRY_US (5LL * 60 * 1000 * 1000)     /* between attempts */
+#define BATT_HIST_CAP (16 * 1024)      /* the whole history text, at most */
+#define BATT_HIST_CHUNK 1500           /* one chat message's payload chars */
+#define BATT_HIST_MSG_CAP (BATT_HIST_CHUNK + 64)   /* the header line plus a chunk */
+#define BATT_HIST_POST_MS 300          /* between posts: let the session task drain its queue */
 
-static char *s_batt_hist_text;         /* PSRAM: the file being written */
-static char *s_batt_hist_env;          /* PSRAM: one request envelope */
-static char s_batt_hist_reply[1024];   /* one reply envelope (dev.21: its ok is read too) */
-static size_t s_batt_hist_env_len;
-static bool s_batt_hist_env_over;
-static int s_batt_hist_status;
-static uint32_t s_batt_hist_gen;
-static SemaphoreHandle_t s_batt_hist_go, s_batt_hist_done;
+static char *s_batt_hist_text;         /* PSRAM: the history being sent */
+static char *s_batt_hist_msg;          /* PSRAM: one message being posted */
+static SemaphoreHandle_t s_batt_hist_go;
 static TaskHandle_t s_batt_hist_task;
 static volatile bool s_batt_hist_busy;
-static int64_t s_batt_hist_ok_us;      /* the last successful upload */
-static int64_t s_batt_hist_try_us;     /* the last attempt */
-/* dev.21: the piece in flight's outcome, filled by batt_hist_write_piece()
- * for batt_hist_task() and the page's note. */
-static int s_batt_hist_piece_no;       /* the piece being written (0-based) */
-static int s_batt_hist_piece_http;     /* its HTTP status, 0 if no reply arrived */
-static int s_batt_hist_piece_ok;       /* its envelope ok: 1 true, 0 false, -1 absent/unread */
-static bool s_batt_hist_piece_refused; /* 403 or ok:false: the daemon refused the write */
-static char s_batt_hist_piece_reply[49];   /* the failing reply's first bytes, "" if none */
 static muse_batt_hist_up_t s_batt_hist_last;   /* the last attempt (Battery page) */
-
-/* On the session task: note the status, hand over, nothing more. */
-static void batt_hist_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
-{
-    if ((uint32_t)(uintptr_t)ctx != s_batt_hist_gen) {
-        return;
-    }
-    if (status != 0) {
-        s_batt_hist_status = status;
-    }
-    if (data && len) {
-        if (s_batt_hist_env_len + len < sizeof(s_batt_hist_reply)) {
-            memcpy(s_batt_hist_reply + s_batt_hist_env_len, data, len);
-            s_batt_hist_env_len += len;
-        } else {
-            s_batt_hist_env_over = true;
-        }
-    }
-    if (end || status < 0) {
-        xSemaphoreGive(s_batt_hist_done);
-    }
-}
 
 /* The file: the wrapper (version, firmware, upload time) around
  * muse_battery_hist_json()'s points and run. False: nothing worth sending. */
@@ -4168,123 +4112,36 @@ static bool batt_hist_build(void)
     return true;
 }
 
-/* dev.21: the reply's envelope ok, read as dash_read_chunk() reads it:
- * 1 true, 0 false, -1 the envelope names no ok, -2 unparseable. The reply
- * is NUL-terminated here (the frame handler's copy leaves room for it). */
-static int batt_hist_reply_ok(void)
+/* One message of the send: the header line, then text[0..n). Built in
+ * PSRAM scratch and handed over as a heap copy -- muse_hatch_text_turn
+ * takes ownership and frees it. True once queued. The session task can
+ * still refuse a queued text turn if a voice turn has the session when
+ * it is handled; the send loop's per-chunk mode check turns that into a
+ * reported failure instead of a silent gap. */
+static bool batt_hist_post(const char *text, size_t n, int idx, int count)
 {
-    s_batt_hist_reply[s_batt_hist_env_len] = '\0';
-    cJSON *root = cJSON_Parse(s_batt_hist_reply);
-    if (!root) {
-        return -2;
+    int head = snprintf(s_batt_hist_msg, BATT_HIST_MSG_CAP, "[battery_history v1 %d/%d]\n", idx, count);
+    if (head < 0 || (size_t)head + n + 1 > BATT_HIST_MSG_CAP) {
+        return false;
     }
-    cJSON *okj = cJSON_GetObjectItemCaseSensitive(root, "ok");
-    int v = !okj ? -1 : (cJSON_IsTrue(okj) ? 1 : 0);
-    cJSON_Delete(root);
-    return v;
+    memcpy(s_batt_hist_msg + head, text, n);
+    s_batt_hist_msg[(size_t)head + n] = '\0';
+    char *copy = strdup(s_batt_hist_msg);
+    if (!copy) {
+        return false;
+    }
+    muse_hatch_text_turn(copy);
+    return true;
 }
 
-/* dev.21: keep the failing reply's first bytes for the Battery page. */
-static void batt_hist_note_reply(void)
+/* The trailer message that ends a send. */
+static bool batt_hist_post_end(void)
 {
-    size_t n = s_batt_hist_env_len < 48 ? s_batt_hist_env_len : 48;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s_batt_hist_reply[i];
-        s_batt_hist_piece_reply[i] = c < 0x20 || c == 0x7f ? ' ' : (char)c;
-    }
-    s_batt_hist_piece_reply[n] = '\0';
-}
-
-/* One /fs/write of text[0..n) to path: the first piece overwrites, the
- * rest append. The text is escaped into the envelope (the history is
- * ASCII, but the run's lock names are text like any other). dev.21: the
- * piece counts as written only on HTTP 200 with an envelope whose ok is
- * not false (dash_read_chunk()'s rule); the outcome lands in the
- * s_batt_hist_piece_* statics either way. */
-static bool batt_hist_write_piece(const char *path, const char *text, size_t n, bool first, int64_t deadline)
-{
-    s_batt_hist_piece_http = 0;
-    s_batt_hist_piece_ok = -1;
-    s_batt_hist_piece_refused = false;
-    s_batt_hist_piece_reply[0] = '\0';
-    char *e = s_batt_hist_env;
-    size_t cap = BATT_HIST_ENV_CAP, len = 0;
-    len += snprintf(e + len, cap - len, "{\"path\":\"%s\",\"text\":\"", path);
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)text[i];
-        const char *esc = c == '"' ? "\\\"" : c == '\\' ? "\\\\" : NULL;
-        if (esc) {
-            if (len + 2 >= cap) {
-                return false;
-            }
-            e[len++] = esc[0];
-            e[len++] = esc[1];
-        } else if (c < 0x20) {
-            if (len + 6 >= cap) {
-                return false;
-            }
-            len += snprintf(e + len, cap - len, "\\u%04x", c);
-        } else {
-            if (len + 1 >= cap) {
-                return false;
-            }
-            e[len++] = (char)c;
-        }
-    }
-    len += snprintf(e + len, cap - len, "\",\"overwrite\":%s,\"append\":%s,\"create_parent\":true}",
-                    first ? "true" : "false", first ? "false" : "true");
-    if (len >= cap) {
+    char *copy = strdup("[battery_history end]");
+    if (!copy) {
         return false;
     }
-    char req_id[40];
-    snprintf(req_id, sizeof(req_id), "muse-%08" PRIx32 "-%08" PRIx32, esp_random(), esp_random());
-    const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web",
-                              "Content-Type", "application/json",
-                              "Accept", "application/json", NULL };
-    s_batt_hist_gen++;
-    s_batt_hist_env_len = 0;
-    s_batt_hist_env_over = false;
-    s_batt_hist_status = 0;
-    xSemaphoreTake(s_batt_hist_done, 0);   /* drain a stale give */
-    int64_t id = muse_link_req_open("POST", "/fs/write", headers, false, batt_hist_on_frame,
-                                    (void *)(uintptr_t)s_batt_hist_gen);
-    if (!id) {
-        ESP_LOGW(TAG, "batt hist: /fs/write open refused (session down or busy)");
-        return false;
-    }
-    if (!muse_link_req_send(id, e, len, true, 2000)) {
-        ESP_LOGW(TAG, "batt hist: /fs/write send failed");
-        muse_link_req_cancel(id);
-        return false;
-    }
-    int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
-    int wait_ms = left_ms > DASH_CHUNK_WAIT_MS ? DASH_CHUNK_WAIT_MS : (int)left_ms;
-    if (wait_ms <= 0 || xSemaphoreTake(s_batt_hist_done, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
-        ESP_LOGW(TAG, "batt hist: /fs/write no reply in %d ms", wait_ms);
-        muse_link_req_cancel(id);
-        s_batt_hist_gen++;
-        return false;
-    }
-    s_batt_hist_piece_http = s_batt_hist_status;
-    if (s_batt_hist_status != 200 || s_batt_hist_env_over) {
-        ESP_LOGW(TAG, "batt hist: /fs/write status %d%s", s_batt_hist_status,
-                 s_batt_hist_env_over ? " (reply too large)" : "");
-        s_batt_hist_piece_refused = s_batt_hist_status == 403;
-        if (s_batt_hist_env_len) {
-            batt_hist_note_reply();
-        }
-        return false;
-    }
-    /* dev.21: HTTP 200 is not enough — the daemon answers {ok, result}
-     * envelopes, and an ok:false write wrote nothing. */
-    int env_ok = batt_hist_reply_ok();
-    s_batt_hist_piece_ok = env_ok == -2 ? -1 : env_ok;
-    if (env_ok == 0 || env_ok == -2) {
-        ESP_LOGW(TAG, "batt hist: /fs/write envelope %s", env_ok == 0 ? "ok:false" : "unparseable");
-        s_batt_hist_piece_refused = env_ok == 0;
-        batt_hist_note_reply();
-        return false;
-    }
+    muse_hatch_text_turn(copy);
     return true;
 }
 
@@ -4293,84 +4150,66 @@ static void batt_hist_task(void *arg)
     (void)arg;
     for (;;) {
         xSemaphoreTake(s_batt_hist_go, portMAX_DELAY);
-        s_batt_hist_try_us = esp_timer_get_time();
-        int64_t deadline = esp_timer_get_time() + DASH_FETCH_DEADLINE_US;
-        while (!muse_link_req_ready() && esp_timer_get_time() < deadline) {
-            vTaskDelay(pdMS_TO_TICKS(250));
-        }
-        bool ok = false;
-        /* dev.21: the attempt's outcome, kept for the Battery page. */
-        muse_batt_hist_up_t up = { .stage = MUSE_BATT_HIST_UP_NONE, .ok = -1 };
-        if (!muse_link_req_ready()) {
-            up.stage = MUSE_BATT_HIST_UP_WAIT_LINK;
-        } else if (s_dash_busy) {
-            up.stage = MUSE_BATT_HIST_UP_DASH_BUSY;
+        muse_batt_hist_up_t up = { .stage = MUSE_BATT_HIST_UP_NONE };
+        if (!muse_hatch_ready()) {
+            up.stage = MUSE_BATT_HIST_UP_WAIT_LINK;   /* no token, or Wi-Fi down */
+        } else if (muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+            up.stage = MUSE_BATT_HIST_UP_BUSY;   /* a voice turn has the session */
         } else if (!batt_hist_build()) {
             up.stage = MUSE_BATT_HIST_UP_BUILD;
         } else {
             size_t total = strlen(s_batt_hist_text);
-            /* dev.21: the path forms in order, starting from the one that
-             * landed last. A refusal (403 / ok:false) advances to the next
-             * form and retries the whole upload; any other failure ends
-             * the attempt, as does the deadline. */
-            for (int form = s_batt_hist_path_idx; form < BATT_HIST_PATH_COUNT && !ok; form++) {
-                ok = total > 0;
-                for (size_t off = 0; off < total && ok; off += BATT_HIST_PIECE) {
-                    size_t n = total - off > BATT_HIST_PIECE ? BATT_HIST_PIECE : total - off;
-                    s_batt_hist_piece_no = (int)(off / BATT_HIST_PIECE);
-                    ok = batt_hist_write_piece(BATT_HIST_PATHS[form], s_batt_hist_text + off, n,
-                                               off == 0, deadline);
-                }
-                up.stage = ok ? MUSE_BATT_HIST_UP_DONE : MUSE_BATT_HIST_UP_WRITE;
-                up.path = form;
-                up.piece = s_batt_hist_piece_no;
-                up.http = s_batt_hist_piece_http;
-                up.ok = s_batt_hist_piece_ok;
-                strlcpy(up.reply, s_batt_hist_piece_reply, sizeof(up.reply));
-                if (ok) {
-                    s_batt_hist_path_idx = form;   /* the winner sticks */
-                } else if (!s_batt_hist_piece_refused || esp_timer_get_time() >= deadline) {
+            int chunks = (int)((total + BATT_HIST_CHUNK - 1) / BATT_HIST_CHUNK);
+            up.total = chunks + 1;   /* the chunks plus the end marker */
+            bool ok = chunks > 0;
+            for (int i = 0; i < chunks && ok; i++) {
+                if (muse_state_mode(NULL) != MUSE_MODE_IDLE) {
+                    up.stage = MUSE_BATT_HIST_UP_BUSY;   /* a press grabbed the session mid-send */
+                    ok = false;
                     break;
                 }
+                size_t off = (size_t)i * BATT_HIST_CHUNK;
+                size_t n = total - off > BATT_HIST_CHUNK ? BATT_HIST_CHUNK : total - off;
+                ok = batt_hist_post(s_batt_hist_text + off, n, i + 1, chunks);
+                if (ok) {
+                    up.sent++;
+                    vTaskDelay(pdMS_TO_TICKS(BATT_HIST_POST_MS));
+                }
             }
+            if (ok) {
+                ok = batt_hist_post_end();
+                if (ok) {
+                    up.sent++;
+                }
+            }
+            if (ok) {
+                up.stage = MUSE_BATT_HIST_UP_DONE;
+                muse_battery_hist_mark_sent();
+                ESP_LOGI(TAG, "batt hist: history sent by chat (%d messages)", up.total);
+            } else if (up.stage == MUSE_BATT_HIST_UP_NONE) {
+                up.stage = MUSE_BATT_HIST_UP_SEND;
+            }
+        }
+        if (up.stage != MUSE_BATT_HIST_UP_DONE) {
+            ESP_LOGW(TAG, "batt hist: chat send failed, stage %d (%d/%d messages)",
+                     up.stage, up.sent, up.total);
         }
         up.at = time(NULL);
         s_batt_hist_last = up;
-        if (ok) {
-            s_batt_hist_ok_us = esp_timer_get_time();
-            muse_battery_hist_mark_sent();
-            ESP_LOGI(TAG, "batt hist: history uploaded");
-        } else {
-            ESP_LOGW(TAG, "batt hist: upload failed; the next ask retries");
-        }
         s_batt_hist_busy = false;
     }
 }
 
-static bool batt_hist_due(void)
+void muse_batt_hist_send_request(void)
 {
-    int64_t now = esp_timer_get_time();
-    if (s_batt_hist_busy || now - s_batt_hist_try_us < BATT_HIST_RETRY_US) {
-        return false;
-    }
-    int unsent = muse_battery_hist_unsent();
-    if (!unsent) {
-        return false;
-    }
-    return !s_batt_hist_ok_us || now - s_batt_hist_ok_us >= BATT_HIST_FRESH_US || unsent >= 4;
-}
-
-void muse_batt_hist_upload_request(void)
-{
-    if (!batt_hist_due()) {
+    if (s_batt_hist_busy) {
         return;
     }
     if (!s_batt_hist_task) {
         s_batt_hist_text = heap_caps_malloc(BATT_HIST_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        s_batt_hist_env = heap_caps_malloc(BATT_HIST_ENV_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_batt_hist_msg = heap_caps_malloc(BATT_HIST_MSG_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         s_batt_hist_go = xSemaphoreCreateBinary();
-        s_batt_hist_done = xSemaphoreCreateBinary();
-        if (!s_batt_hist_text || !s_batt_hist_env || !s_batt_hist_go || !s_batt_hist_done ||
+        if (!s_batt_hist_text || !s_batt_hist_msg || !s_batt_hist_go ||
             msw_task_create(batt_hist_task, "batthist", 8192, NULL, tskIDLE_PRIORITY + 2,
                             &s_batt_hist_task) != pdPASS) {
             s_batt_hist_task = NULL;
