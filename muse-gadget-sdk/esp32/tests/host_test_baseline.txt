@@ -1,0 +1,56 @@
+# museStopWatch esp32 host-test baseline — the known FAIL/ERROR set
+# for the standard flow (tests/run_host_tests.py). The runner diffs
+# every run against this file: entries appearing that are not listed
+# here fail the run; listed entries that pass are reported as FIXED.
+#
+# derived_commit: 28a055d438af64b0ee1714cbc3a8eaa2473ec2c0
+# derived_date: 2026-11-17
+# derived_how: recorded from the verified clean serial run of 2026-11-17
+#   (unittest discover with an equivalent collector, wall 1809.8 s,
+#   EPERM-free; the runner's subset runs reproduced its per-module
+#   results exactly). The runner's own --update-baseline runs that day
+#   were refused — correctly — because the VM's storage write limiter
+#   tainted them; re-derive with --update-baseline on a quiet VM.
+# environment: Python 3.12.3 on Linux x86_64; no ESP-IDF
+#   managed_components in this VM, so classes whose setUpClass compiles
+#   against managed_components/espressif__cjson (and similar) error
+#   at setUpClass here. That is an environment property, not a code
+#   regression: on a machine with the components fetched, those
+#   classes run and this baseline must be re-derived.
+# counts: tests=952 failures=13 errors=17 skipped=10
+#
+# Re-derive this file ONLY when test code or the C harnesses change,
+# or when the environment changes (new system packages, components
+# fetched, Python/cc upgrades). Firmware-source-only changes must
+# NOT re-derive it — that is the whole point of recording it.
+
+ERROR: setUpClass (test_link_discovery.LinkDiscoveryTest)
+ERROR: setUpClass (test_link_reterminal_sht4x.LinkReterminalSht4xTest)
+ERROR: setUpClass (test_link_sensecap_sensors.LinkSensecapSensorsTest)
+ERROR: setUpClass (test_link_waveshare_154g_shtc3.LinkWaveshare154gShtc3Test)
+ERROR: setUpClass (test_muse_caption_hint.CaptionHint)
+ERROR: setUpClass (test_muse_chat_link_errors.ChatLinkErrors)
+ERROR: setUpClass (test_muse_chat_link_note.LinkVoiceNote)
+ERROR: setUpClass (test_muse_chat_session.ChatSession)
+ERROR: setUpClass (test_muse_eink_navigation.MuseEinkNavigationTest)
+ERROR: setUpClass (test_muse_eink_presentation.MuseEinkTextValidationTest)
+ERROR: setUpClass (test_muse_eink_presentation.MuseEinkWifiOwnershipTest)
+ERROR: setUpClass (test_muse_ptt_ui.StopWatchPTT)
+ERROR: setUpClass (test_muse_voice_call.VoicePeCallLoop)
+ERROR: setUpClass (test_muse_voice_note.HatchVoiceNote)
+ERROR: setUpClass (test_stopwatch_controls.StopWatchControls)
+ERROR: test_real_renderer_stays_in_bounds_across_repeated_state_changes (test_speaking_animation.SpeakingAnimation.test_real_renderer_stays_in_bounds_across_repeated_state_changes)
+ERROR: test_session_start_reports_local_task_failure (test_link_transport_contract.LinkTransportContractTest.test_session_start_reports_local_task_failure)
+FAIL: test_all_link_log_tags_are_namespaced (test_link_diagnostic_log.LinkDiagnosticLogHarnessTest.test_all_link_log_tags_are_namespaced)
+FAIL: test_avatar_prompt_allows_the_default_avatars_includes (test_speaking_animation.SpeakingAnimation.test_avatar_prompt_allows_the_default_avatars_includes)
+FAIL: test_calls_off_leaves_the_session_as_it_was (test_muse_voice_call.VoiceCallWiring.test_calls_off_leaves_the_session_as_it_was)
+FAIL: test_downloads_and_memory_with_psram (test_link_image_fetch.LinkImageFetchHarnessTest.test_downloads_and_memory_with_psram)
+FAIL: test_downloads_and_memory_without_psram (test_link_image_fetch.LinkImageFetchHarnessTest.test_downloads_and_memory_without_psram)
+FAIL: test_health_fields_for_reterminal_ui_and_other_boards (test_reterminal_battery.ReterminalBatteryTest.test_health_fields_for_reterminal_ui_and_other_boards)
+FAIL: test_power_key_interrupt (test_stopwatch_power.StopWatchPower.test_power_key_interrupt)
+FAIL: test_registration_only_advertises_enabled_ota (test_link_ota.LinkOtaTest.test_registration_only_advertises_enabled_ota)
+FAIL: test_session_compiles_with_calls_on (test_muse_voice_call.VoiceCallWiring.test_session_compiles_with_calls_on)
+FAIL: test_spotpear_band_comes_back_in_place (test_muse_full_reply.FullReplyTest.test_spotpear_band_comes_back_in_place) (cjk=True, latin=False)
+FAIL: test_spotpear_band_comes_back_in_place (test_muse_full_reply.FullReplyTest.test_spotpear_band_comes_back_in_place) (cjk=True, latin=True)
+FAIL: test_with_both_fonts (test_muse_full_reply.FullReplyTest.test_with_both_fonts)
+FAIL: test_with_cjk_font (test_muse_full_reply.FullReplyTest.test_with_cjk_font)
