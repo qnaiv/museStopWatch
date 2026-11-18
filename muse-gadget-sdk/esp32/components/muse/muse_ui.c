@@ -276,6 +276,18 @@ static struct {
 } s_trains;
 static void trains_line(char *buf, size_t cap, const struct tm *local, bool have_time);   /* the dash section, below */
 static void trains_consider(cJSON *root);   /* the dash section, below */
+static void approvals_consider(cJSON *root);   /* the desk section, below */
+
+/* dev.28: the edition's approvals block, as approvals_consider() last
+ * parsed it (the desk section, below). No block in the edition = zero
+ * waiting and not working. Static and small: a count, a flag, two
+ * lines of at most 63 bytes. */
+static struct {
+    int n;
+    bool working;
+    char items[2][64];
+} s_appr;
+static bool s_desk_shown;   /* the desk face is up: the clock face and the care accessories yield to it */
 static int64_t s_dash_info_us;   /* when the edition behind those strings landed (the dash section's s_dash_ok_us, copied by render_dash) */
 static bool s_clock_mode;              /* the face shows the clock */
 static bool s_clock_shown;             /* the clock box is up right now */
@@ -2190,7 +2202,7 @@ static void update_face_mode(void)
     bool caption_up = !lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
                       || (s_reply_lbl && !lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN))
                       || s_full_lbl || s_ask_shown;
-    bool show = s_clock_mode && !s_care_open && !caption_up
+    bool show = s_clock_mode && !s_care_open && !caption_up && !s_desk_shown
                 && muse_state_mode(NULL) == MUSE_MODE_IDLE;
     if (show != s_clock_shown) {
         s_clock_shown = show;
@@ -2259,7 +2271,7 @@ static void care_accessories(void)
     static int last_rx = -1, last_ry, last_w, last_stage;
     static bool last_show;
     int stage = care_stage();
-    bool show = s_face_active && !s_clock_shown && !s_care_open;
+    bool show = s_face_active && !s_clock_shown && !s_care_open && !s_desk_shown;
     lv_area_t c, f;
     lv_obj_get_coords(s_canvas, &c);
     lv_obj_get_coords(s_face, &f);
@@ -3799,6 +3811,7 @@ static void render_dash(void)
     }
     if (root) {
         trains_consider(root);   /* dev.22: cache a new timetable, if this edition carries one */
+        approvals_consider(root);   /* dev.28: the desk face's approval queue, if this edition carries one */
         cJSON_Delete(root);
     }
 }
@@ -4118,6 +4131,196 @@ static void update_dash(void)
     if (s_dash_dirty) {
         s_dash_dirty = false;
         render_dash();
+    }
+}
+
+/*
+ * dev.28: the charging desk mode. On USB power the face tile becomes a
+ * desk display for Muse's approval queue: the screen stays on (the
+ * input task's auto-sleep is held off while muse_ui_desk_active()),
+ * the pending count stands large in the middle — quiet grey at zero,
+ * red from one up — with up to two waiting items under it, then the
+ * working state, the time and the battery in small type, and うづ
+ * shrunk to the bottom of the face, typing while the edition says
+ * Muse is working (frame_tick bends the pose). The data is the
+ * edition's "approvals" block, lifted out of every fetch by
+ * approvals_consider(); while the desk is up the edition is re-fetched
+ * every minute through dash_request() — a charging fetch, so the
+ * dev.26 quiet-hours gate does not apply to it (that gate covers the
+ * sleep periodic check and the wake-edge fetch only); quiet hours
+ * instead dim this face's colours. Unplug, or leave the face tile,
+ * and everything returns to normal. The whole layout drifts a few
+ * pixels on a five-minute cycle against OLED burn-in.
+ */
+#define DESK_FETCH_US (60LL * 1000 * 1000)
+#define DESK_SHIFT_US (5LL * 60 * 1000 * 1000)
+#define DESK_BASE_Y (-64)          /* the column's centre offset: room below for うづ */
+#define COLOR_DESK_ALERT 0xff5252
+#define COLOR_DESK_ALERT_DIM 0x8c2f2f
+
+static lv_obj_t *s_desk_box, *s_desk_title, *s_desk_count;
+static lv_obj_t *s_desk_item[2], *s_desk_state;
+static volatile bool s_desk_on;    /* charging, on the face tile (the input task reads it) */
+static int64_t s_desk_fetch_us;    /* the last desk-driven fetch */
+static int s_desk_shift = -1;      /* the burn-in shift in place */
+
+static void approvals_consider(cJSON *root)
+{
+    s_appr.n = 0;
+    s_appr.working = false;
+    s_appr.items[0][0] = '\0';
+    s_appr.items[1][0] = '\0';
+    cJSON *ap = cJSON_GetObjectItemCaseSensitive(root, "approvals");
+    if (!cJSON_IsObject(ap)) {
+        return;   /* no block: nothing waiting, as far as the watch knows */
+    }
+    cJSON *n = cJSON_GetObjectItemCaseSensitive(ap, "n");
+    if (cJSON_IsNumber(n)) {
+        s_appr.n = n->valueint < 0 ? 0 : n->valueint > 99 ? 99 : n->valueint;
+    }
+    s_appr.working = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ap, "working"));
+    cJSON *items = cJSON_GetObjectItemCaseSensitive(ap, "items");
+    if (cJSON_IsArray(items)) {
+        for (int i = 0; i < 2; i++) {
+            cJSON *it = cJSON_GetArrayItem(items, i);
+            if (!cJSON_IsString(it)) {
+                continue;
+            }
+            snprintf(s_appr.items[i], sizeof(s_appr.items[i]), "%s", it->valuestring);
+            /* Keep the 63-byte cut on a UTF-8 boundary: drop a
+             * trailing partial sequence rather than draw its bytes. */
+            char *s = s_appr.items[i];
+            size_t len = strlen(s), cut = 0;
+            for (size_t j = 0; j < len;) {
+                unsigned char c = (unsigned char)s[j];
+                size_t w = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+                if (j + w > len) {
+                    break;
+                }
+                j += w;
+                cut = j;
+            }
+            s[cut] = '\0';
+        }
+    }
+}
+
+bool muse_ui_desk_active(void)
+{
+    return s_desk_on;
+}
+
+static void build_desk(lv_obj_t *face)
+{
+    s_desk_box = lv_obj_create(face);
+    lv_obj_remove_style_all(s_desk_box);
+    lv_obj_remove_flag(s_desk_box, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_desk_box, 380, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_desk_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_desk_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_desk_box, 10, 0);
+    lv_obj_align(s_desk_box, LV_ALIGN_CENTER, 0, DESK_BASE_Y);
+    s_desk_title = make_label(s_desk_box, caption_font(), COLOR_DIM);
+    lv_label_set_text(s_desk_title, "承認待ち");
+    s_desk_count = make_label(s_desk_box, FONT_CLOCK, COLOR_DIM);
+    lv_label_set_text(s_desk_count, "0");
+    /* The count at 300%: Montserrat tops out at 48, so like the clock
+     * (build_clock, 200%) it is drawn through a transform, with
+     * symmetric padding reserving the scaled height in the column. */
+    lv_obj_set_style_transform_scale_x(s_desk_count, 768, 0);
+    lv_obj_set_style_transform_scale_y(s_desk_count, 768, 0);
+    lv_obj_set_style_transform_pivot_x(s_desk_count, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_desk_count, lv_pct(50), 0);
+    int pad = lv_font_get_line_height(FONT_CLOCK);
+    lv_obj_set_style_pad_top(s_desk_count, pad, 0);
+    lv_obj_set_style_pad_bottom(s_desk_count, pad, 0);
+    for (int i = 0; i < 2; i++) {
+        s_desk_item[i] = make_label(s_desk_box, caption_font(), COLOR_LIT);
+        lv_obj_set_size(s_desk_item[i], 320, LV_SIZE_CONTENT);
+        lv_obj_set_style_text_align(s_desk_item[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(s_desk_item[i], LV_LABEL_LONG_MODE_DOTS);
+    }
+    s_desk_state = make_label(s_desk_box, caption_font(), COLOR_DIM);
+    lv_obj_set_size(s_desk_state, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_desk_state, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_desk_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void update_desk(void)
+{
+    if (!s_desk_box) {
+        return;
+    }
+    muse_power_t p = muse_state_power();
+    bool on_tile = s_tv && lv_tileview_get_tile_active(s_tv) == s_face;
+    s_desk_on = p.charging && on_tile;
+    bool caption_up = !lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
+                      || (s_reply_lbl && !lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN))
+                      || s_full_lbl || s_ask_shown;
+    /* The desk yields like the clock face does: to a turn, a reply,
+     * the care panel, the timer and pomodoro panels. */
+    bool show = s_desk_on && !s_care_open && !s_timer_open && !s_pomo_open
+                && !caption_up && muse_state_mode(NULL) == MUSE_MODE_IDLE;
+    if (show != s_desk_shown) {
+        s_desk_shown = show;
+        lv_obj_set_flag(s_desk_box, LV_OBJ_FLAG_HIDDEN, !show);
+        if (show) {
+            lv_obj_move_foreground(s_desk_box);
+            move_muse(face_px() * 2 / 5, 172);   /* うづ keeps the bottom of the face */
+            s_desk_fetch_us = 0;   /* a fetch on entry, below */
+        } else if (!s_desk_on && !caption_up) {
+            move_muse(face_px(), s_big_y);   /* unplugged or left the tile: the face is its own again */
+        }
+    }
+    if (!show) {
+        return;
+    }
+    int64_t now_us = esp_timer_get_time();
+    /* The 60-second refetch: the desk is a live display, so while it
+     * is up the edition is kept fresh — quiet hours included; they
+     * dim the face below, they do not gate this fetch. */
+    if (now_us - s_desk_fetch_us >= DESK_FETCH_US) {
+        s_desk_fetch_us = now_us;
+        dash_request();
+    }
+    /* Burn-in: a few pixels of drift, on a five-minute cycle. */
+    static const int8_t SHIFT[8][2] = {
+        {0, 0}, {3, 2}, {-2, 3}, {-3, -1}, {1, -3}, {4, 0}, {-4, 1}, {0, -3},
+    };
+    int shift = (int)(now_us / DESK_SHIFT_US % 8);
+    if (shift != s_desk_shift) {
+        s_desk_shift = shift;
+        lv_obj_align(s_desk_box, LV_ALIGN_CENTER, SHIFT[shift][0], DESK_BASE_Y + SHIFT[shift][1]);
+    }
+    bool dim = muse_ui_quiet_active();
+    uint32_t alert = dim ? COLOR_DESK_ALERT_DIM : COLOR_DESK_ALERT;
+    lv_obj_set_style_text_color(s_desk_count, lv_color_hex(s_appr.n > 0 ? alert : COLOR_DIM), 0);
+    lv_obj_set_style_text_color(s_desk_title, lv_color_hex(s_appr.n > 0 ? alert : COLOR_DIM), 0);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%d", s_appr.n);
+    if (strcmp(buf, lv_label_get_text(s_desk_count)) != 0) {
+        lv_label_set_text(s_desk_count, buf);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (strcmp(s_appr.items[i], lv_label_get_text(s_desk_item[i])) != 0) {
+            lv_label_set_text(s_desk_item[i], s_appr.items[i]);
+        }
+        lv_obj_set_flag(s_desk_item[i], LV_OBJ_FLAG_HIDDEN, !s_appr.items[i][0]);
+        lv_obj_set_style_text_color(s_desk_item[i], lv_color_hex(dim ? COLOR_DIM : COLOR_LIT), 0);
+    }
+    struct tm local;
+    bool have_time = msw_time_now && msw_time_now(&local);
+    char tbuf[16];
+    snprintf(tbuf, sizeof(tbuf), have_time ? "%02d:%02d" : "--:--",
+             have_time ? local.tm_hour : 0, have_time ? local.tm_min : 0);
+    if (p.battery_pct >= 0) {
+        snprintf(buf, sizeof(buf), "%s ・ %s ・ %d%%",
+                 s_appr.working ? "作業中" : "待機中", tbuf, p.battery_pct);
+    } else {
+        snprintf(buf, sizeof(buf), "%s ・ %s", s_appr.working ? "作業中" : "待機中", tbuf);
+    }
+    if (strcmp(buf, lv_label_get_text(s_desk_state)) != 0) {
+        lv_label_set_text(s_desk_state, buf);
     }
 }
 
@@ -4610,6 +4813,7 @@ static void build_screen(void)
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
     build_care(face);    /* dev.14: the care panel, food and accessories */
     build_clock(face);   /* dev.14: the yellow button's clock face */
+    build_desk(face);    /* dev.28: the charging desk face */
     build_timer(face);   /* dev.16: the countdown timer panel and its alert */
     build_pomodoro(face);   /* dev.22: the pomodoro panel and its alert */
 #endif
@@ -4854,6 +5058,18 @@ bool muse_ui_dark(void)
 static bool update_sleep(void)
 {
     bool asleep = muse_state_asleep();
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+    /* dev.28: plugging in while asleep wakes the watch into the desk
+     * face — once, on the charging edge, so a sleep the user asked
+     * for while already charging stands. */
+    static bool s_desk_was_charging;
+    bool charging_now = muse_state_power().charging;
+    if (charging_now && !s_desk_was_charging && asleep) {
+        muse_state_set_asleep(false);
+        asleep = false;
+    }
+    s_desk_was_charging = charging_now;
+#endif
     if (asleep && !s_dark) {
         muse_menu_close();
         apply_brightness(0);
@@ -5519,6 +5735,7 @@ static void frame_tick(lv_timer_t *timer)
     update_care(now);     /* dev.14: care meters, food, accessories, growth */
     update_timer(now);    /* dev.16: timer opens, the fired alert, the clock row */
     update_pomodoro(now);   /* dev.22: pomodoro opens, the fired alert, the shared clock row */
+    update_desk();          /* dev.28: the charging desk face, its minute fetch */
 #endif
     if (s_tv && lv_obj_get_scroll_x(s_tv) != face_scroll_x()) {
         /* Off screen, or sliding to or from settings: hold still so the
@@ -5547,7 +5764,7 @@ static void frame_tick(lv_timer_t *timer)
      * idle; a neglected one (mood under 30) dozes instead — the OFF
      * pose's closed eyes at part brightness — a few seconds at a time.
      * Neither while the care panel or the clock owns the face. */
-    if (mode == MUSE_MODE_IDLE && !s_care_open && !s_clock_shown) {
+    if (mode == MUSE_MODE_IDLE && !s_care_open && !s_clock_shown && !s_desk_shown) {
         if (s_care.mood >= 60) {
             if (fmodf(now, 7.0f) < 1.4f && pose.happy < 0.7f) {
                 pose.happy = 0.7f;
@@ -5564,6 +5781,12 @@ static void frame_tick(lv_timer_t *timer)
     if (mode == MUSE_MODE_IDLE && s_pomo_open && s_pomo.phase != POMO_IDLE) {
         pose.happy = s_pomo.phase == POMO_FOCUS ? 0.0f : 1.0f;
     }
+    /* dev.28: on the desk face, the edition's working flag types:
+     * うづ takes the working pose while Muse is on a turn. */
+    if (s_desk_shown && s_appr.working && mode == MUSE_MODE_IDLE) {
+        pose.mode = MUSE_MODE_THINKING;
+        pose.working = 1.0f;
+    }
 #endif
     bool render = !muse_board->epaper || mode != s_last_epaper_pose;
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
@@ -5579,7 +5802,7 @@ static void frame_tick(lv_timer_t *timer)
      * only ever skips pose renders. */
     static unsigned s_quiet_ticks;
     static unsigned s_frame_ticks;
-    bool quiet = mode == MUSE_MODE_IDLE && s_face_active
+    bool quiet = mode == MUSE_MODE_IDLE && s_face_active && !s_desk_shown
                  && lv_obj_has_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN)
                  && (!s_reply_lbl || lv_obj_has_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN));
     if (quiet) {

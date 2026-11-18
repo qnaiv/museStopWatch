@@ -482,7 +482,10 @@ static void check_sleep(void)
     if (muse_voice_in_call()) return;
     int after = muse_settings_sleep_s();
     float mode_t;
+    /* dev.28: the charging desk face stays lit — no auto-sleep while
+     * it holds the face (a manual sleep still stands). */
     if (after && !muse_state_asleep() && muse_state_mode(&mode_t) == MUSE_MODE_IDLE
+        && !muse_ui_desk_active()
         && muse_state_idle_secs() > after) {
         set_asleep(true, "auto-sleep");
     }

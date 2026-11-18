@@ -92,6 +92,10 @@ void muse_ui_set_quiet_config(const muse_quiet_cfg_t *cfg);
  * when the setting is off, the window is empty, or the clock is not
  * set yet. */
 bool muse_ui_quiet_active(void);
+/* museStopWatch dev.28: true while the charging desk mode holds the
+ * face (USB charging, the face tile up): the input task leaves
+ * auto-sleep off, so the desk display stays lit. */
+bool muse_ui_desk_active(void);
 /* museStopWatch dev.25: send the battery history to Muse as chat
  * messages, so Muse can save and analyse it. Called only by the
  * Battery page's 「履歴を送る」 button — a manual send, never automatic
